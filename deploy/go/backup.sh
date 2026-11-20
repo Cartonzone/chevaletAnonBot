@@ -6,6 +6,11 @@
 # the bot's /app/backups — so the `/admin backup` command can send the newest
 # file. Keeps the newest 100 backups.
 #
+# 2026-11-19 (Sebastian): the standby's DB container was created with
+# POSTGRES_DB=postgres while the real data lives in "mydatabase", so the old
+# `-d $POSTGRES_DB` produced an empty 590-byte dump that was discarded and the
+# notifier then reported "backup file not found". Dump the real DB explicitly.
+#
 # NOTE: no `docker exec -t` here — cron has no TTY and -t both fails and corrupts
 # the piped binary (that was the old backup-tiered.sh bug).
 #
@@ -15,6 +20,7 @@ set -e
 
 BACKUP_DIR=/opt/chevalet-go-staging/backups
 DB_CONTAINER=telegram-bot-db
+DB_NAME=mydatabase
 KEEP=100
 
 mkdir -p "$BACKUP_DIR"
@@ -22,7 +28,7 @@ TS=$(date +%Y%m%d_%H%M%S)
 OUT="$BACKUP_DIR/backup_mydatabase_${TS}.sql.gz"
 
 docker exec "$DB_CONTAINER" sh -c \
-  'PGPASSWORD=$POSTGRES_PASSWORD pg_dump -U $POSTGRES_USER -d $POSTGRES_DB --clean --if-exists --create --encoding=UTF8' \
+  "PGPASSWORD=\$POSTGRES_PASSWORD pg_dump -U \$POSTGRES_USER -d $DB_NAME --clean --if-exists --create --encoding=UTF8" \
   | gzip > "$OUT"
 
 # Guard against a truncated/empty dump being kept as a "backup".
