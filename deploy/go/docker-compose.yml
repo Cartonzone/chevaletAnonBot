@@ -9,17 +9,26 @@
 #   - PROXY       = your proxy URL (Telegram is otherwise unreachable)
 #   - DB_NAME / DB_USER / DB_PASS = anything (a fresh test db is created here)
 # DB_HOST is overridden to the postgres service below.
+#
+# env_file passes EVERY key (same H-9 fix as the production compose), so this
+# stack exercises the real config surface instead of a hand-maintained subset.
 
 services:
   go-postgres:
     image: postgres:16-alpine
     container_name: chevalet-go-db
     restart: unless-stopped
+    stop_grace_period: 30s
     environment:
       POSTGRES_DB: ${DB_NAME}
       POSTGRES_USER: ${DB_USER}
       POSTGRES_PASSWORD: ${DB_PASS}
       POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     volumes:
       - go_postgres_data:/var/lib/postgresql/data
     networks:
@@ -36,46 +45,35 @@ services:
       dockerfile: Dockerfile
     container_name: chevalet-go-bot
     restart: unless-stopped
+    init: true
+    stop_grace_period: 60s
     depends_on:
       go-postgres:
         condition: service_healthy
+    env_file:
+      - .env
     environment:
       - DB_HOST=go-postgres
-      - DB_NAME=${DB_NAME}
-      - DB_USER=${DB_USER}
-      - DB_PASS=${DB_PASS}
-      - BOT_TOKEN=${BOT_TOKEN}
-      - PROXY=${PROXY}
-      - REPORT_CHAT_ID=${REPORT_CHAT_ID}
-      - ERROR_CHAT_ID=${ERROR_CHAT_ID}
-      - ADMINS=${ADMINS}
-      - SELLER_ADMIN=${SELLER_ADMIN}
-      - SUPPORT_ADMIN=${SUPPORT_ADMIN}
-      - LOG_LEVEL=${LOG_LEVEL}
-      - MAX_NAME_LENGTH=${MAX_NAME_LENGTH}
-      - DEFAULT_CID_LIMIT=${DEFAULT_CID_LIMIT}
-      - MAX_CID_LENGTH=${MAX_CID_LENGTH}
-      - MIN_CID_LENGTH=${MIN_CID_LENGTH}
-      - HEALTH_PORT=${HEALTH_PORT}
-      - BOT_HEALTH_PORT=${BOT_HEALTH_PORT}
-      - BASE_ADDRESS=${BASE_ADDRESS}
-      - SEND_GM_GN=${SEND_GM_GN}
-      - GM_TIME=${GM_TIME}
-      - GN_TIME=${GN_TIME}
-      - GM_GROUP_ID=${GM_GROUP_ID}
-      - GM_GROUP_TOPIC_ID=${GM_GROUP_TOPIC_ID}
-      - AI_URL=${AI_URL}
-      - AI_SESSION_ID=${AI_SESSION_ID}
-      - AI_INTERVAL=${AI_INTERVAL}
-      - DONATION_LINK=${DONATION_LINK}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    volumes:
+      # The bot validates that its backups dir exists at startup (v3.4.1 fails
+      # closed otherwise). In production backup-v2.sh publishes real dumps here;
+      # for staging an empty dir is enough (compose creates it).
+      - ./backups:/app/backups
     networks:
       - go-bot-network
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 ${HEALTH_PORT} || exit 1"]
+      # HTTP health endpoint (v3.4.1+); $${...} is resolved INSIDE the container
+      # from its own env, so the probe follows the same HEALTH_PORT the bot uses.
+      test: ["CMD-SHELL", "wget -q -O /dev/null \"http://127.0.0.1:$${HEALTH_PORT:-12564}/healthz\" || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 20s
+      start_period: 30s
 
 networks:
   go-bot-network:

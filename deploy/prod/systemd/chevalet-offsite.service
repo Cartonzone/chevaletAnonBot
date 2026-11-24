@@ -1,0 +1,16 @@
+[Unit]
+Description=Chevalet off-host backup push (rclone/rsync, sha256-verified)
+Documentation=https://github.com/aturzone/chevaletAnonBot/blob/main/docs/operations/BACKUP-VERIFY.md
+After=chevalet-backup.service network-online.target
+Wants=network-online.target
+OnFailure=chevalet-alert@%n.service
+
+[Service]
+Type=oneshot
+User=root
+EnvironmentFile=-/etc/chevalet/ops.env
+ExecStart=/opt/bots/chevalet/ops/offsite-push.sh
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=1200

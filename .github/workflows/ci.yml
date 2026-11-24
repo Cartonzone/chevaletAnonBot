@@ -1,5 +1,14 @@
 name: CI
 
+# Quality gates on every push/PR, and the tag-driven production deploy.
+#
+# The deploy job is deliberately behind `vars.DEPLOY_ENABLED == 'true'`: the
+# tag-driven deploy script was written for the OLD host and the CURRENT production
+# host (Germany) does not have the forced-command deploy path installed yet. Until
+# deploy/prod/ROLLOUT.md step "re-establish deploy" is done, tagging a release must
+# not attempt any server-side action. Set the repository variable DEPLOY_ENABLED to
+# "true" once the host-side script is installed and verified.
+
 on:
   push:
     branches: ["**"]
@@ -13,6 +22,10 @@ on:
         description: "Existing version tag to deploy to production (e.g. v1.1.0)"
         required: true
         type: string
+
+# Third-party actions are referenced by major tag, not a full commit SHA. SHA
+# pinning is tracked as P2 in audit/2026-11-24/PLAN.md (needs online lookup and
+# a policy for updates); do not "fix" it by guessing SHAs.
 
 jobs:
   build-test:
@@ -48,18 +61,191 @@ jobs:
             exit 1
           fi
 
-      # The DB integration test skips automatically when DB_HOST is unset, so the
-      # encoder golden vectors and the rest run here without a database.
+      # DB-backed tests skip themselves when DB_HOST is unset; the encoder golden
+      # vectors and the rest run here without a database. The integration job
+      # below runs the same suite WITH a real PostgreSQL.
       - name: go test (race)
         run: go test -race -count=1 ./...
 
+  integration-test:
+    name: integration tests (PostgreSQL)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: chevalet_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d chevalet_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DB_HOST: 127.0.0.1
+      DB_PORT: "5432"
+      DB_USER: postgres
+      DB_PASS: postgres
+      # The db package's destructive tests DROP tables and hard-refuse to run
+      # unless the database name ends in `_test`.
+      DB_NAME: chevalet_test
+      # The bot handler e2e tests need their OWN database (see
+      # internal/bot/anchor_integration_test.go: the db tests drop whole tables,
+      # so sharing one database makes `go test ./...` flaky across packages).
+      BOT_TEST_DB: botit
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Create the bot e2e database
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client
+          PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -U "$DB_USER" -d postgres \
+            -v ON_ERROR_STOP=1 -c 'CREATE DATABASE botit;'
+
+      # Same command CI already trusts, but now the DB/e2e tests actually run
+      # instead of skipping (their coverage was ~2% / 17% before this job).
+      - name: go test -race (with database)
+        run: go test -race -count=1 ./...
+
+  staticcheck:
+    name: staticcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      # staticcheck.conf at the repo root configures the checks (ST1018 disabled
+      # for the Persian ZWNJ). Blocking on purpose.
+      - name: staticcheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          "$(go env GOPATH)/bin/staticcheck" ./...
+
+  govulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      # Blocking by design. If this flags a standard-library CVE, the fix is to
+      # bump the Go toolchain in go.mod + CI — not to skip the check. Module-level
+      # findings that are unreachable from our call graph are reported as such by
+      # govulncheck and do not fail the run.
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
+  docker-build:
+    name: docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: docker build
+        run: docker build -t chevalet-ci .
+
+  shell-lint:
+    name: shellcheck / bash -n
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+      # Blocking for the scripts we ship as ops tooling (backup/restore/drill/
+      # offsite/watchdog/alert + the staging helpers). Legacy root-level scripts
+      # (backup.sh, backup-tiered.sh, restore.sh) are NOT shellcheck-gated here:
+      # they are superseded by deploy/prod/ops/backup-v2.sh + restore-v2.sh and
+      # scheduled for removal (audit P2-1); they still get the syntax check below.
+      - name: shellcheck (ops scripts)
+        run: shellcheck -S warning --exclude=SC1090 deploy/prod/ops/*.sh deploy/go/*.sh
+      - name: bash -n (every shell script in the repo)
+        run: |
+          mapfile -t files < <(git ls-files -z '*.sh' | tr '\0' '\n')
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "no shell scripts found (unexpected)" >&2
+            exit 1
+          fi
+          printf 'syntax-checking %d script(s)\n' "${#files[@]}"
+          bash -n "${files[@]}"
+
+  config-check:
+    name: compose config (every stack)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      # `env_file: .env` is what fixes the H-9 config drift, but it makes the
+      # compose file undeployable without a .env. Validate every stack with the
+      # documented example env: this fails if a compose file references a key the
+      # example does not document, or if the YAML/interpolation is broken.
+      - name: docker compose config
+        run: |
+          set -euo pipefail
+          cp .env.example .env
+          docker compose -f docker-compose.yml config -q
+          cp .env.example deploy/prod/.env
+          docker compose -f deploy/prod/docker-compose.live.yml config -q
+          for pair in \
+            "deploy/go/docker-compose.yml:.env" \
+            "deploy/go/docker-compose.prod.yml:.env.prod" \
+            "deploy/go/docker-compose.cutover.yml:.env.prod" \
+            "deploy/go/docker-compose.sharedtest.yml:.env.sharedtest"; do
+            file="${pair%%:*}"; envfile="${pair##*:}"
+            cp .env.example "deploy/go/${envfile}"
+            docker compose -f "$file" config -q
+          done
+
   deploy:
     name: deploy ${{ github.event.inputs.tag || github.ref_name }} to production
-    needs: build-test
+    needs:
+      - build-test
+      - integration-test
+      - staticcheck
+      - govulncheck
+      - docker-build
+      - shell-lint
+      - config-check
     # Deploys are deliberate: either a vX.Y.Z tag was pushed, or someone asked
     # for a specific tag via the Run workflow button. Never on a branch push,
     # never on a PR — pushing to main no longer touches production.
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    #
+    # DEPLOY_ENABLED gate: the server-side forced command was built for the old
+    # host and is not installed on the current (Germany) host yet, so tagging a
+    # release must not attempt a deploy until deploy/prod/ROLLOUT.md's deploy
+    # section is done and the repository variable DEPLOY_ENABLED is set to true.
+    if: >-
+      (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')
+      && vars.DEPLOY_ENABLED == 'true'
     runs-on: ubuntu-latest
     environment: production
     steps:

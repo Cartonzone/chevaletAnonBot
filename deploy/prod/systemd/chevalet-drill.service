@@ -1,0 +1,17 @@
+[Unit]
+Description=Chevalet automated restore drill (disposable local Postgres)
+Documentation=https://github.com/aturzone/chevaletAnonBot/blob/main/docs/operations/RESTORE.md
+After=docker.service
+Wants=docker.service
+OnFailure=chevalet-alert@%n.service
+
+[Service]
+Type=oneshot
+User=root
+EnvironmentFile=-/etc/chevalet/ops.env
+ExecStart=/opt/bots/chevalet/ops/restore-drill.sh
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+# Pulling postgres:16-alpine on a cold host can take a while.
+TimeoutStartSec=1800

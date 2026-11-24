@@ -1,4 +1,11 @@
-# PRODUCTION CUTOVER — the Go bot becomes production.
+# HISTORICAL: the 2026-11 production cutover stack used to replace the Python
+# bot with the Go bot on the OLD shared-database host.
+#
+# > CURRENT PRODUCTION (since 2026-11-24) is the Germany host; the stack of
+# > record is deploy/prod/docker-compose.live.yml (container `telegram-bot`,
+# > project `chevalet`, root /opt/bots/chevalet). This file documents the
+# > cutover era and its hard-coded /opt/chevalet-go-staging paths are
+# > HISTORICAL — do not use them on the current host.
 #
 # Runs the Go bot with the PRODUCTION bot token against the production Postgres
 # (telegram-bot-db), replacing the Python bot. The Python container is stopped
@@ -24,6 +31,7 @@ services:
     container_name: chevalet-go-bot-prod
     restart: unless-stopped
     init: true
+    stop_grace_period: 60s
     env_file:
       - .env.prod
     environment:
@@ -32,20 +40,26 @@ services:
       # in the container's throwaway layer — every redeploy recreates the container
       # and would silently reset whatever an admin had configured.
       DYNSET_PATH: /app/state/dynamic_settings.json
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     volumes:
       # Host backups dir -> where `/admin backup` reads the newest dump. Filled
-      # hourly by deploy/go/backup.sh (cron). Absolute path = this server's deploy.
+      # hourly by deploy/go/backup.sh (cron). Absolute path = THIS OLD server's
+      # historical deploy root; the current production path is /opt/bots/chevalet.
       - /opt/chevalet-go-staging/backups:/app/backups
       # Survives redeploys — see DYNSET_PATH above.
       - /opt/chevalet-go-staging/state:/app/state
     networks:
       - prod
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 12564 || exit 1"]
+      test: ["CMD-SHELL", "wget -q -O /dev/null \"http://127.0.0.1:$${HEALTH_PORT:-12564}/healthz\" || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 20s
+      start_period: 30s
 
 networks:
   prod:

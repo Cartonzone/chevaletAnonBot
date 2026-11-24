@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily Chevalet restore drill
+
+[Timer]
+# Daily 04:30 (host local time; the production host runs UTC). Deliberately in
+# the quiet window. Persistent=true means a missed drill runs after downtime.
+OnCalendar=*-*-* 04:30:00
+Persistent=true
+RandomizedDelaySec=600
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

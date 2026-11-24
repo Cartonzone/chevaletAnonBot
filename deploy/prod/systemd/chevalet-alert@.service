@@ -1,0 +1,10 @@
+[Unit]
+Description=Chevalet ops alert for %i
+Documentation=https://github.com/aturzone/chevaletAnonBot/blob/main/docs/operations/INCIDENT-TRIAGE.md
+
+[Service]
+Type=oneshot
+User=root
+# ALERT_TOKEN / ALERT_CHAT_ID come from the root-only ops env file.
+EnvironmentFile=-/etc/chevalet/ops.env
+ExecStart=/opt/bots/chevalet/ops/alert.sh "systemd unit failed: %i"

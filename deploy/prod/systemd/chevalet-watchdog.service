@@ -1,0 +1,19 @@
+[Unit]
+Description=Chevalet external watchdog (runs on the MONITORING host, not production)
+Documentation=https://github.com/aturzone/chevaletAnonBot/blob/main/docs/operations/INCIDENT-TRIAGE.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+# This unit lives on Atur's workstation / a second host. Install the ops scripts
+# there (see deploy/prod/README.md) and adjust ExecStart if the path differs.
+EnvironmentFile=-/etc/chevalet/ops.env
+Environment=STATE_DIR=/var/lib/chevalet-watchdog
+StateDirectory=chevalet-watchdog
+StateDirectoryMode=0700
+ExecStart=/opt/chevalet/ops/watchdog.sh
+# 0 = all green, 1 = a check failed. The script alerts on state changes itself;
+# no OnFailure= here to avoid double alerts.
+TimeoutStartSec=180

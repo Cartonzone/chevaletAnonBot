@@ -1,0 +1,20 @@
+[Unit]
+Description=Chevalet verified DB backup (dump -> verify -> publish -> retention)
+Documentation=https://github.com/aturzone/chevaletAnonBot/blob/main/docs/operations/BACKUP-VERIFY.md
+After=docker.service network-online.target
+Wants=network-online.target
+OnFailure=chevalet-alert@%n.service
+
+[Service]
+Type=oneshot
+# Root is required to `docker exec` the production database container.
+User=root
+# Production paths and alert credentials. The file is optional (`-`), mode 600,
+# and lives outside the repo: /etc/chevalet/ops.env (see deploy/prod/README.md).
+EnvironmentFile=-/etc/chevalet/ops.env
+ExecStart=/opt/bots/chevalet/ops/backup-v2.sh
+# Backup is I/O nice to the live bot/database: best-effort scheduling, low priority.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=600

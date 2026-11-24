@@ -45,7 +45,7 @@ tokens travel through Telegram.
   management, AI settings, backups
 - Optional AI auto-reply in a configured group
 - Daily good-morning / good-night greetings (Asia/Tehran)
-- TCP health endpoint, graceful shutdown, structured logging
+- HTTP health endpoints (`/healthz`, `/readyz`), graceful shutdown, structured logging
 
 ## Tech stack
 
@@ -89,7 +89,9 @@ All configuration is via environment variables (loaded from `.env`). See
 | `REPORT_CHAT_ID` / `ERROR_CHAT_ID` | Chats for reports and error notifications |
 | `GM_GROUP_ID` / `GM_GROUP_TOPIC_ID` | Group/topic for greetings & AI replies |
 | `AI_URL` / `AI_SESSION_ID` / `AI_INTERVAL` | Optional AI auto-reply endpoint |
-| `HEALTH_PORT` | TCP health-check port |
+| `HEALTH_PORT` | HTTP health port (`/healthz`, `/readyz`, loopback only) |
+| `DB_SSLMODE` / `DB_CONNECT_TIMEOUT_SECONDS` / `DB_MAX_CONNS` | DB TLS mode / bounded connect / pool size (v3.4.1) |
+| `HEALTH_WATCHDOG_SECONDS` / `HEARTBEAT_URL` | hung-bot watchdog / optional dead-man heartbeat (v3.4.1) |
 | `DONATION_LINK` | Link shown by `/donate` |
 
 ## Development
@@ -101,6 +103,7 @@ go build ./...
 go vet ./...
 gofmt -l .            # should print nothing
 go test ./...         # encoder golden vectors + DB tests (DB tests skip without DB_HOST)
+mkdir -p backups     # runtime asset dir; v3.4.1 fails closed if it is missing
 go run ./cmd/bot      # needs a populated .env + reachable PostgreSQL (+ PROXY)
 ```
 
@@ -115,38 +118,60 @@ internal/db/        PostgreSQL layer (pgx)
 internal/encoder/   the chevaletid cipher (+ golden test)
 internal/config/    env configuration
 internal/texts/     Texts/*.txt loader
-internal/health/    TCP health listener
+internal/health/    HTTP health listener (/healthz, /readyz)
 internal/dynset/    dynamic_settings.json (runtime-tunable AI settings)
 Texts/              Persian message templates
-deploy/go/          isolated staging stack
+deploy/go/          isolated staging stack + historical cutover files
+deploy/prod/        production stack of record + backup/DR/ops scripts
+docs/operations/    incident/restore/DR/deploy/backup/disk runbooks
 ```
 
 ## Staging
 
 To live-test against a throwaway PostgreSQL isolated from production (with a
 **staging** bot token), use the stack in [`deploy/go/`](deploy/go/README.md).
+The production stack of record is
+[`deploy/prod/docker-compose.live.yml`](deploy/prod/docker-compose.live.yml).
 
-## Production deployment & cutover
+## Backups, DR & operations
 
-Production deploys are **tag-driven**: pushing a `vX.Y.Z` tag is what ships
-code. Pushing to `main` runs the tests but does *not* touch production.
+The 2026-11-23 incident (a dead provider disk + no off-host copy) is why the repo
+now ships a rehearsed data layer:
 
-```sh
-git tag -a v1.2.0 -m "what changed"
-git push origin v1.2.0        # CI tests it, then deploys that exact tag
-```
+- **Verified backups**: 15-minute dumps checked for size/`gzip -t`/pg_dump
+  footer/table count, with sha256 + manifest, published atomically
+  ([`deploy/prod/ops/backup-v2.sh`](deploy/prod/ops/backup-v2.sh)).
+- **Off-host copies, destination-agnostic**: rclone to Cloudflare R2/Backblaze B2
+  or an rsync/encrypted external mirror — no provider lock-in
+  ([`deploy/prod/ops/offsite-push.sh`](deploy/prod/ops/offsite-push.sh)).
+- **Automated restore drills** into a throwaway Postgres
+  ([`deploy/prod/ops/restore-drill.sh`](deploy/prod/ops/restore-drill.sh)), and a
+  guarded production restore that keeps the previous database
+  ([`deploy/prod/ops/restore-v2.sh`](deploy/prod/ops/restore-v2.sh)).
+- **External monitoring**: a read-only SSH watchdog + healthchecks.io dead-man
+  switch ([`deploy/prod/ops/watchdog.sh`](deploy/prod/ops/watchdog.sh)).
 
-To roll back (or redeploy any earlier version), run the **CI** workflow from the
-Actions tab with the target tag as input — no new tag or rebuild needed, since
-each release keeps its own image on the server.
+Rollout (phased, reversible) and the ops-environment reference are in
+[`deploy/prod/README.md`](deploy/prod/README.md) and
+[`deploy/prod/ROLLOUT.md`](deploy/prod/ROLLOUT.md); failure runbooks live in
+[`docs/operations/`](docs/operations/). Release notes:
+[`docs/hardening/RELEASE-v3.4.1.md`](docs/hardening/RELEASE-v3.4.1.md).
 
-The full release/rollback runbook, the server-side script, and how the
-forced-command restriction on the deploy key works are documented in
-[`deploy/go/RELEASING.md`](deploy/go/RELEASING.md).
+## Production deployment & operations
 
-For the near-zero-downtime cutover from the original Python bot to this Go bot —
-they share the same database schema, so no data migration is needed — see
-[`MIGRATION.md`](MIGRATION.md).
+Production (`@Chevalet_bot`) runs on the Germany host as containers
+`telegram-bot` / `telegram-bot-db` (project `chevalet`, root `/opt/bots/chevalet`).
+Deploys are **tag-driven by design** (pushing a `vX.Y.Z` tag ships that exact tag;
+pushing to `main` only runs tests), but the server-side deploy path is currently
+being re-established on the new host — until then the CI deploy job is gated off
+and deploys use the controlled, backed-up manual path.
+
+- Current deploy/rollback procedure:
+  [`docs/operations/DEPLOY-ROLLBACK.md`](docs/operations/DEPLOY-ROLLBACK.md) and
+  [`deploy/prod/ROLLOUT.md`](deploy/prod/ROLLOUT.md).
+- Historical tag-pipeline mechanics (old host): [`deploy/go/RELEASING.md`](deploy/go/RELEASING.md).
+- The Python→Go cutover (same schema, no data migration) is recorded in
+  [`MIGRATION.md`](MIGRATION.md); it is complete, not a pending operation.
 
 ## Contributing
 

@@ -1,0 +1,13 @@
+[Unit]
+Description=Chevalet DB backup every 15 minutes
+
+[Timer]
+# Every 15 minutes (:00, :15, :30, :45). Persistent=true runs a missed backup
+# once after downtime instead of silently skipping it (cron has no such thing).
+OnCalendar=*:0/15
+Persistent=true
+RandomizedDelaySec=30
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

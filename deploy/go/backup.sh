@@ -1,25 +1,30 @@
 #!/bin/sh
-# Hourly production DB backup for the Go bot.
+# HISTORICAL / STAGING ONLY — the old-host hourly backup (Go-port cutover era).
 #
-# Dumps telegram-bot-db using the postgres container's OWN credentials (so it is
-# correct regardless of the app .env) into the host dir that is bind-mounted to
-# the bot's /app/backups — so the `/admin backup` command can send the newest
-# file. Keeps the newest 100 backups.
+# Do NOT use this for current production: it targets the retired
+# /opt/chevalet-go-staging layout and has none of the v2 guarantees (structure
+# checks, sha256 manifest, off-host push, drill, alerting). Production uses
+# deploy/prod/ops/backup-v2.sh instead — see deploy/prod/README.md.
+#
+# What it did: dump telegram-bot-db with the postgres container's OWN credentials
+# into the host dir bind-mounted to the bot's /app/backups (so `/admin backup`
+# could send the newest file). Kept the newest $KEEP backups.
 #
 # NOTE: no `docker exec -t` here — cron has no TTY and -t both fails and corrupts
 # the piped binary (that was the old backup-tiered.sh bug).
 #
-# Cron (hourly):
+# Cron on the OLD host (hourly):
 #   0 * * * * /opt/chevalet-go-staging/deploy/go/backup.sh >> /opt/chevalet-go-staging/logs/backup.log 2>&1
-set -e
+set -eu
 
-BACKUP_DIR=/opt/chevalet-go-staging/backups
-DB_CONTAINER=telegram-bot-db
-KEEP=100
+BACKUP_DIR="${BACKUP_DIR:-/opt/chevalet-go-staging/backups}"
+DB_CONTAINER="${DB_CONTAINER:-telegram-bot-db}"
+DB_NAME="${DB_NAME:-mydatabase}"
+KEEP="${KEEP:-100}"
 
 mkdir -p "$BACKUP_DIR"
 TS=$(date +%Y%m%d_%H%M%S)
-OUT="$BACKUP_DIR/backup_mydatabase_${TS}.sql.gz"
+OUT="$BACKUP_DIR/backup_${DB_NAME}_${TS}.sql.gz"
 
 docker exec "$DB_CONTAINER" sh -c \
   'PGPASSWORD=$POSTGRES_PASSWORD pg_dump -U $POSTGRES_USER -d $POSTGRES_DB --clean --if-exists --create --encoding=UTF8' \

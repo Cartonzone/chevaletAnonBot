@@ -4,7 +4,13 @@ This document records how ChevaletAnonBot was ported from Python
 (`python-telegram-bot` + psycopg2) to Go (`gotgbot` + pgx), with the goal of a
 **near-zero-downtime production cutover** that preserves every user, link,
 setting and feature. It is kept as design documentation (notably the cipher
-compatibility contract and the cutover runbook).
+compatibility contract and the cutover runbook below).
+
+> **Status: COMPLETE.** The production cutover happened on 2026-11-23/24; the
+> Python bot is no longer the production poller. This document is history plus the
+> compatibility contract, not a pending procedure. Current production topology and
+> operations live in [`deploy/prod/`](deploy/prod/) and
+> [`docs/operations/`](docs/operations/).
 
 This repository contains **only** the Go implementation. The original Python bot
 lives in a separate project; this port keeps the **identical** database schema,
@@ -65,8 +71,14 @@ every reply/seen/block/report button on historical messages breaks.
 | `Texts/*.txt` via `fetch_text` | embed or read at startup (cache) | keep the `Texts/` dir |
 | `error_handler.py` | central dispatcher error hook | notify `ERROR_CHAT_ID` |
 
-Static assets reused verbatim: `Texts/`, `dynamic_settings.json`, `.env`,
-`docker-compose.yml` (bot image swapped), the `backup*.sh`/`restore.sh` scripts.
+Static assets reused during the port: `Texts/`, `dynamic_settings.json`, `.env`,
+`docker-compose.yml` (bot image swapped), the old `backup*.sh`/`restore.sh` scripts.
+
+> The old backup/restore scripts are **superseded**: production now uses the
+> verified, rehearsed scripts in [`deploy/prod/ops/`](deploy/prod/ops/)
+> (`backup-v2.sh`, `offsite-push.sh`, `restore-drill.sh`, `restore-v2.sh`). The
+> legacy scripts are kept only for pre-cutover history and are unsafe on the
+> current host (same-disk only, `docker exec -t` dump corruption class).
 
 ---
 
@@ -151,7 +163,13 @@ reply-not-found, Forbidden).
 
 ---
 
-## Cutover runbook (production)
+## Cutover runbook (HISTORICAL — executed 2026-11-23/24, kept as record)
+
+> This runbook targeted the old shared-database host (`telegram-bot-db` + Python
+> `bot` service, project `chevaletbot_bot`). It is preserved for the record; do not
+> run it on the current Germany host. For restores today see
+> [`docs/operations/RESTORE.md`](docs/operations/RESTORE.md), for deploys
+> [`docs/operations/DEPLOY-ROLLBACK.md`](docs/operations/DEPLOY-ROLLBACK.md).
 
 1. `make backup` — safety snapshot (`pg_dump | gzip`).
 2. Build & ship the Go bot image; point it at the **same** Postgres,
@@ -177,6 +195,7 @@ mid-compose) and the in-memory AI queue. Both are seconds-scale and self-heal.
 ```sh
 go build ./...
 go test ./...                     # encoder golden vectors must stay green
+mkdir -p backups                  # v3.4.1 startup validation requires it
 go run ./cmd/bot                  # needs a populated .env (see .env.example)
 ```
 

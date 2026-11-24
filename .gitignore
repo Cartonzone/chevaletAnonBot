@@ -37,3 +37,7 @@ vendor/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local audit/hardening artifacts (contain infra details + user data; never publish)
+/audit/
+/.cache/

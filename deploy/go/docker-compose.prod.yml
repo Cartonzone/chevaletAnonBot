@@ -1,4 +1,4 @@
-# PRODUCTION cutover stack for the Go bot — SHARED DATABASE.
+# HISTORICAL: the 2026-11 Go-port cutover stack for the OLD shared-database host.
 #
 # The Go bot connects to the EXISTING production Postgres container
 # (telegram-bot-db) — the SAME database the Python bot uses. The schema is
@@ -6,6 +6,12 @@
 # work. This file does NOT define a postgres service and does NOT touch the
 # Python stack; cutover is "stop the python container, up this one", and
 # rollback is the reverse. See CUTOVER.md.
+#
+# > CURRENT PRODUCTION (since 2026-11-24) is the Germany host with its own
+# > sanitized stack: deploy/prod/docker-compose.live.yml (repo source of truth),
+# > container `telegram-bot` / `telegram-bot-db`, project `chevalet`, root
+# > /opt/bots/chevalet. This file is kept for the historical cutover record and
+# > is NOT the production stack of record.
 #
 # Before use, fill in:
 #   - deploy/go/.env.prod   : a copy of the PRODUCTION .env (real BOT_TOKEN, DB
@@ -26,50 +32,34 @@ services:
     container_name: chevalet-go-bot-prod
     restart: unless-stopped
     init: true
+    stop_grace_period: 60s
+    env_file:
+      - .env.prod
     environment:
-      # DB_HOST is pinned to the existing production Postgres container name.
+      # DB_HOST is pinned to the existing production Postgres container name;
+      # every other key comes from .env.prod verbatim (no silent drops).
       - DB_HOST=telegram-bot-db
-      - DB_PORT=${DB_PORT:-5432}
-      - DB_NAME=${DB_NAME}
-      - DB_USER=${DB_USER}
-      - DB_PASS=${DB_PASS}
-      - BOT_TOKEN=${BOT_TOKEN}
-      - PROXY=${PROXY}
-      - REPORT_CHAT_ID=${REPORT_CHAT_ID}
-      - ERROR_CHAT_ID=${ERROR_CHAT_ID}
-      - ADMINS=${ADMINS}
-      - SELLER_ADMIN=${SELLER_ADMIN}
-      - SUPPORT_ADMIN=${SUPPORT_ADMIN}
-      - LOG_LEVEL=${LOG_LEVEL}
-      - MAX_NAME_LENGTH=${MAX_NAME_LENGTH}
-      - DEFAULT_CID_LIMIT=${DEFAULT_CID_LIMIT}
-      - MAX_CID_LENGTH=${MAX_CID_LENGTH}
-      - MIN_CID_LENGTH=${MIN_CID_LENGTH}
-      - HEALTH_PORT=${HEALTH_PORT}
-      - BOT_HEALTH_PORT=${BOT_HEALTH_PORT}
-      - BASE_ADDRESS=${BASE_ADDRESS}
-      - SEND_GM_GN=${SEND_GM_GN}
-      - GM_TIME=${GM_TIME}
-      - GN_TIME=${GN_TIME}
-      - GM_GROUP_ID=${GM_GROUP_ID}
-      - GM_GROUP_TOPIC_ID=${GM_GROUP_TOPIC_ID}
-      - AI_URL=${AI_URL}
-      - AI_SESSION_ID=${AI_SESSION_ID}
-      - AI_INTERVAL=${AI_INTERVAL}
-      - DONATION_LINK=${DONATION_LINK}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     volumes:
       # Reuse the production AI dynamic settings for continuity (admin ai-url /
       # ai-session). Copy the python bot's file here first (see CUTOVER.md), or
       # remove this line to start from the .env AI_URL/AI_SESSION_ID defaults.
       - ./prod-dynamic_settings.json:/app/dynamic_settings.json
+      # Startup fails closed when /app/backups is missing; the operations backup
+      # dir on this OLD host was /opt/chevalet-go-staging/backups (historical path).
+      - /opt/chevalet-go-staging/backups:/app/backups
     networks:
       - prod
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 ${HEALTH_PORT:-12564} || exit 1"]
+      test: ["CMD-SHELL", "wget -q -O /dev/null \"http://127.0.0.1:$${HEALTH_PORT:-12564}/healthz\" || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 20s
+      start_period: 30s
 
 networks:
   prod:

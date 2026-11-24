@@ -1,9 +1,13 @@
-# PRE-CUTOVER SHADOW TEST — the Go TEST bot on the LIVE production database.
+# PRE-CUTOVER SHADOW TEST (HISTORICAL): the Go TEST bot on the LIVE production
+# database of the OLD host.
 #
 # Runs the Go bot with the TEST bot token against the SAME production Postgres
 # (telegram-bot-db) that the Python bot uses, so the Go bot can be validated
 # against real production data WITHOUT cutting over. The Python production bot
 # keeps serving users, untouched.
+#
+# > HISTORICAL: this belongs to the pre-cutover era on the old shared-DB host.
+# > Current production is the Germany host — see deploy/prod/docker-compose.live.yml.
 #
 # Why this is safe for production:
 #   - Telegram will not let the TEST bot message a user who never started it, so
@@ -31,21 +35,31 @@ services:
     container_name: chevalet-go-bot
     restart: unless-stopped
     init: true
+    stop_grace_period: 60s
     env_file:
       - .env.sharedtest
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    volumes:
+      # Startup fails closed when /app/backups is missing; a local empty dir is
+      # enough for this shadow test (compose creates it).
+      - ./backups:/app/backups
     networks:
       - prod
-    # HEALTH_PORT is 12564 in .env.sharedtest; hardcoded here so the probe needs
-    # no compose-level interpolation.
+    # HEALTH_PORT comes from .env.sharedtest; resolved inside the container so
+    # the probe needs no compose-level interpolation.
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 12564 || exit 1"]
+      test: ["CMD-SHELL", "wget -q -O /dev/null \"http://127.0.0.1:$${HEALTH_PORT:-12564}/healthz\" || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 20s
+      start_period: 30s
 
 networks:
   prod:
     external: true
-    # The docker network telegram-bot-db is attached to (verified on the server).
+    # The docker network telegram-bot-db is attached to (verified on the old server).
     name: chevaletbot_bot-network

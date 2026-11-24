@@ -1,8 +1,17 @@
-# Staging the Go bot
+# Staging the Go bot (+ historical cutover files)
 
 Run the Go port against a throwaway Postgres, isolated from production, to
 live-test it with a **staging** bot token. Telegram is unreachable without a
 proxy, so a working `PROXY` is required.
+
+> **Current production is NOT this stack.** Since 2026-11-24 production runs on the
+> Germany host with [`deploy/prod/docker-compose.live.yml`](../prod/docker-compose.live.yml)
+> (containers `telegram-bot` / `telegram-bot-db`, project `chevalet`, root
+> `/opt/bots/chevalet`). The cutover-era files here
+> (`docker-compose.prod.yml`, `docker-compose.cutover.yml`,
+> `docker-compose.sharedtest.yml`, `backup.sh`, `nightly-backup-backstop.sh`) are
+> **historical** and their `/opt/chevalet-go-staging/...` paths refer to the OLD
+> host. Do not use them on the current host.
 
 ## Steps (on a server/host that has Docker + proxy access)
 
@@ -52,30 +61,28 @@ proxy, so a working `PROXY` is required.
 
 `.env` is git-ignored — the token never lands in the repo.
 
-## Production backup crons
+## Backups (HISTORICAL section — current procedure is deploy/prod)
 
-The production deploy (`docker-compose.cutover.yml`, `/opt/chevalet-go-staging`
-on the server) runs two host-side cron jobs alongside the bot container:
+This staging-era `backup.sh`/`nightly-backup-backstop.sh` pair belonged to the OLD
+host's `/opt/chevalet-go-staging` deploy. Production now uses the verified
+15-minute pipeline in [`deploy/prod/ops/`](../prod/ops/):
 
-```
-0 * * * *  /opt/chevalet-go-staging/deploy/go/backup.sh                      # hourly DB dump
-40 20 * * * /opt/chevalet-go-staging/deploy/go/nightly-backup-backstop.sh    # re-send if the bot's own nightly send failed
-```
+- `backup-v2.sh` — dump → verify → publish (sha256 + manifest) → retention →
+  alert; `--gate` for pre-deploy.
+- `offsite-push.sh` — destination-agnostic off-host copy (rclone to R2/B2 or an
+  rsync/encrypted mirror), sha256-verified.
+- `restore-drill.sh` / `restore-v2.sh` — automated drill and guarded restore.
 
-`backup.sh` dumps `telegram-bot-db` hourly into the host `backups/` dir, which
-is bind-mounted into the container at `/app/backups`. Once a night at
-`BACKUP_TIME` (`internal/bot/background.go`'s `backupLoop`) the bot itself
-sends the newest file to `BACKUP_CHAT_ID` — a personal DM or a private channel
-the bot administers — and touches `backups/.nightly-backup-sent`.
-`nightly-backup-backstop.sh` runs a few minutes after `BACKUP_TIME` and
-re-sends the same file only if that marker is missing or stale — see the
-script's header comment for why it checks a marker file rather than `docker
-logs` (the latter caused nightly duplicate sends in production).
+The bot's nightly Telegram send to `BACKUP_CHAT_ID` still exists
+(`internal/bot/background.go`'s `backupLoop`) but is **tertiary only** and is not
+counted toward the RPO. See [`docs/operations/BACKUP-VERIFY.md`](../../docs/operations/BACKUP-VERIFY.md)
+and [`deploy/prod/README.md`](../prod/README.md).
 
 ## Notes
 
-- This stack is for staging/verification only; the production cutover (Go bot
-  pointed at the **real** shared Postgres) is described in `../../MIGRATION.md`.
+- This stack is for staging/verification only. Production is the Germany host
+  (`deploy/prod/`); the historical Python→Go cutover is recorded in
+  [`../../MIGRATION.md`](../../MIGRATION.md).
 - To verify just the database layer against this Postgres, without Telegram:
 
   ```sh

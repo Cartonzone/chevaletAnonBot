@@ -1,0 +1,11 @@
+[Unit]
+Description=Chevalet watchdog every 5 minutes (monitoring host)
+
+[Timer]
+OnCalendar=*:0/5
+Persistent=true
+RandomizedDelaySec=20
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

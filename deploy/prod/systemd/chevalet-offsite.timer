@@ -1,0 +1,13 @@
+[Unit]
+Description=Chevalet off-host backup push every 15 minutes
+
+[Timer]
+# Offset from chevalet-backup.timer so the push always sees a freshly published
+# artifact and the two never run at the same instant.
+OnCalendar=*:5/15
+Persistent=true
+RandomizedDelaySec=30
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

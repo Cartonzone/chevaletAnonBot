@@ -1,0 +1,111 @@
+# LIVE production stack of record — ChevaletAnonBot on the Germany host.
+#
+# SANITIZED COPY. This is the reviewed source of truth for /opt/bots/chevalet;
+# the values below were reconstructed from audit/2026-11-24/PRODUCTION-STATE.md.
+# It contains no secrets: every secret comes from the host `.env` (mode 600),
+# which is NOT in git. Before installing on the host, run the pre-flight
+# "capture the live stack" step in ROLLOUT.md — the running compose/volumes must
+# be read and reconciled first; never overwrite them from a guessed merge.
+#
+# Layout on the host:
+#   /opt/bots/chevalet/docker-compose.yml   <- this file
+#   /opt/bots/chevalet/.env                <- secrets, 600 root
+#   /opt/bots/chevalet/state/              <- dynamic_settings.json (302: admin state survives redeploys)
+#   /opt/bots/chevalet/backups-v2/published/ <- verified dumps only, read-only for the bot
+#   project: chevalet · containers: telegram-bot, telegram-bot-db
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: telegram-bot-db
+    restart: unless-stopped
+    stop_grace_period: 30s
+    # The DB is only reachable on the internal compose network; never publish it.
+    # DO NOT `docker compose down` this stack (it removes/stops the DB): use
+    # `docker stop/start telegram-bot` for the bot alone.
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASS}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - bot-network
+    # Resource limits (W5.4) are a deliberate production change: uncomment only
+    # in a maintenance window with approval. Current usage is ~8.5 MB (bot) and
+    # ~39 MB (DB), so these bounds are safe but were not applied in v3.4.0.
+    # mem_limit: 1g
+    # cpus: 1.5
+
+  bot:
+    image: chevalet-bot:${IMAGE_TAG:-latest}
+    container_name: telegram-bot
+    restart: unless-stopped
+    init: true
+    # Let the updater finish the in-flight update and drain the batcher/outbox on
+    # SIGTERM (H-3). Docker's 10 s default SIGKILLs mid-drain.
+    stop_grace_period: 60s
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # Deliberate override only: the DB is the compose service, not whatever the
+      # host .env has (which is localhost for non-Docker runs). Every other key —
+      # including ones added in future versions — comes from .env via env_file.
+      - DB_HOST=postgres
+      # Runtime-tunable settings live on the state mount, never in the container
+      # layer (otherwise every redeploy silently resets admin configuration).
+      - DYNSET_PATH=/app/state/dynamic_settings.json
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    volumes:
+      - /opt/bots/chevalet/state:/app/state
+      # /admin backup sends only certified artifacts (backup-v2.sh publishes here
+      # atomically after verification), never a half-written dump.
+      # Mounted read-WRITE on purpose: the bot also writes the zero-byte
+      # `.nightly-backup-sent` dedup marker into this directory after a successful
+      # Telegram send (background.go touchNightlySentMarker). With :ro that write
+      # fails and the host-side nightly backstop re-sends every night (duplicate
+      # sends). The bot never writes dump files here — only that marker.
+      - /opt/bots/chevalet/backups-v2/published:/app/backups
+    healthcheck:
+      # HTTP liveness (poll/dispatcher progress), not a bare TCP socket. Busybox
+      # wget is in the alpine runtime image. /readyz is additionally checked by
+      # the off-host watchdog (it includes the DB ping).
+      test: ["CMD-SHELL", "wget -q -O /dev/null \"http://127.0.0.1:$${HEALTH_PORT:-12564}/healthz\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - bot-network
+    # mem_limit: 256m
+    # cpus: 1.0
+
+networks:
+  bot-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+    driver: local
+    # The live DB predates this repo copy. When adopting this file for the first
+    # time, ROLLOUT.md requires matching the EXISTING data volume name
+    # (`docker volume ls | grep -i postgres`) and pinning it here as
+    # `name: <existing volume>` so the stack attaches to the current data.

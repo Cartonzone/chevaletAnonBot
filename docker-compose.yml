@@ -4,6 +4,14 @@
 #   cp .env.example .env   # then fill in BOT_TOKEN, ADMINS, PROXY, ...
 #   make up                # or: docker compose up -d --build
 #
+# Config plumbing: the bot service reads the WHOLE `.env` through `env_file`, so
+# every key internal/config knows about reaches the process. The explicit
+# `environment:` block below keeps ONLY the deliberate per-stack overrides
+# (DB_HOST points at the compose service, not at whatever the host `.env` says).
+# This replaces the old hand-maintained whitelist that silently dropped config
+# keys (BACKUP_CHAT_ID, DYNSET_PATH, AI_ENABLED, BATCH_*, TOKEN_KEYS, ...) — see
+# docs/hardening/RELEASE-v3.4.1.md (H-9).
+#
 # The Go bot runs `CREATE TABLE IF NOT EXISTS` on startup, so no schema file is
 # needed — existing data is preserved untouched.
 
@@ -13,11 +21,19 @@ services:
     image: postgres:16-alpine
     container_name: telegram-bot-db
     restart: unless-stopped
+    # Docker's default 10 s is shorter than a checkpoint under load; 30 s lets
+    # the engine shut down cleanly instead of being SIGKILLed.
+    stop_grace_period: 30s
     environment:
       POSTGRES_DB: ${DB_NAME}
       POSTGRES_USER: ${DB_USER}
       POSTGRES_PASSWORD: ${DB_PASS}
       POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./backups:/backups
@@ -35,38 +51,24 @@ services:
     container_name: telegram-bot
     restart: unless-stopped
     init: true
+    # Long enough for the updater to finish the in-flight update and drain the
+    # batcher/outbox on SIGTERM. Docker's 10 s default used to SIGKILL us
+    # mid-drain on every `docker compose up -d`.
+    stop_grace_period: 60s
     depends_on:
       postgres:
         condition: service_healthy
+    env_file:
+      - .env
     environment:
+      # Deliberate override: the bot talks to the compose service by name.
+      # Everything else (including new keys) comes from .env via env_file.
       - DB_HOST=postgres
-      - DB_NAME=${DB_NAME}
-      - DB_USER=${DB_USER}
-      - DB_PASS=${DB_PASS}
-      - BOT_TOKEN=${BOT_TOKEN}
-      - PROXY=${PROXY}
-      - REPORT_CHAT_ID=${REPORT_CHAT_ID}
-      - ERROR_CHAT_ID=${ERROR_CHAT_ID}
-      - ADMINS=${ADMINS}
-      - SELLER_ADMIN=${SELLER_ADMIN}
-      - SUPPORT_ADMIN=${SUPPORT_ADMIN}
-      - LOG_LEVEL=${LOG_LEVEL}
-      - MAX_NAME_LENGTH=${MAX_NAME_LENGTH}
-      - DEFAULT_CID_LIMIT=${DEFAULT_CID_LIMIT}
-      - MAX_CID_LENGTH=${MAX_CID_LENGTH}
-      - MIN_CID_LENGTH=${MIN_CID_LENGTH}
-      - HEALTH_PORT=${HEALTH_PORT}
-      - BOT_HEALTH_PORT=${BOT_HEALTH_PORT}
-      - BASE_ADDRESS=${BASE_ADDRESS}
-      - SEND_GM_GN=${SEND_GM_GN}
-      - GM_TIME=${GM_TIME}
-      - GN_TIME=${GN_TIME}
-      - GM_GROUP_ID=${GM_GROUP_ID}
-      - GM_GROUP_TOPIC_ID=${GM_GROUP_TOPIC_ID}
-      - AI_URL=${AI_URL}
-      - AI_SESSION_ID=${AI_SESSION_ID}
-      - AI_INTERVAL=${AI_INTERVAL}
-      - DONATION_LINK=${DONATION_LINK}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     volumes:
       # dynamic_settings.json is read/written at runtime (admin ai-url / ai-session).
       - ./dynamic_settings.json:/app/dynamic_settings.json
@@ -75,15 +77,16 @@ services:
     networks:
       - bot-network
     healthcheck:
-      # The Go bot opens a TCP health listener on 127.0.0.1:HEALTH_PORT; nc
-      # (busybox) ships in the alpine runtime image. Use an explicit 127.0.0.1
-      # (not "localhost", which may resolve to ::1 first and miss the IPv4-only
-      # listener).
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 ${HEALTH_PORT} || exit 1"]
+      # HTTP liveness/readiness endpoint, not a bare TCP connect: the old
+      # `nc -z` probe stayed green while polling/DB was dead, so Docker never
+      # restarted a hung bot. Busybox `wget` ships in this image (alpine:3.20).
+      # A missing endpoint (pre-v3.4.1 image) fails the probe loudly instead of
+      # silently accepting a dead bot.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:${HEALTH_PORT:-12564}/healthz || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 20s
+      start_period: 30s
 
 networks:
   bot-network:

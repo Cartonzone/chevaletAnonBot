@@ -36,3 +36,7 @@ vendor/
 # OS cruft
 .DS_Store
 Thumbs.db
+
+# Local audit/test scratch (never build context)
+.cache/
+audit/
