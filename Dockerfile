@@ -3,7 +3,7 @@
 # Build context is the repository root. The same image is used for production
 # (docker-compose.yml) and staging (deploy/go/docker-compose.yml).
 
-FROM golang:1.25-alpine AS build
+FROM golang:1.26.11-alpine AS build
 WORKDIR /src
 
 # Cache module downloads.
@@ -19,6 +19,13 @@ FROM alpine:3.20
 # tzdata: Asia/Tehran for the GM/GN greetings (also embedded in the binary).
 RUN apk add --no-cache ca-certificates tzdata
 WORKDIR /app
+
+# The bot fails closed at startup when its backups directory is missing (the
+# nightly delivery and /admin backup read it). Staging/sharedtest compose stacks
+# do not bind-mount it, so create the empty directory in the image; a mounted
+# volume simply overlays it. Running the binary outside Docker needs the same
+# (`mkdir -p backups` in the working directory).
+RUN mkdir -p /app/backups
 
 COPY --from=build /out/bot /app/bot
 # Static message templates are read from ./Texts at runtime.
