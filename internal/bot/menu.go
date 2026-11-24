@@ -89,6 +89,9 @@ func menuBarKeyboard() gotgbot.ReplyKeyboardMarkup {
 // markMenuBarSent records that the bar has reached this user, for callers that
 // attached it to a message of their own (see /start). Best effort: the only cost of
 // failure is showing the install notice once more.
+// the CODE-AUDIT backlog; it is deliberately not wired yet.
+//
+//lint:ignore U1000 kept for the /start bar-refresh caller that is tracked in
 func (b *Bot) markMenuBarSent(userid string) {
 	dbctx, cancel := b.bg()
 	defer cancel()

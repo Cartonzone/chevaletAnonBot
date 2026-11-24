@@ -15,6 +15,8 @@ import (
 )
 
 // settingsMenuData is every callback_data the settings main menu emits.
+//
+//lint:ignore U1000 test helper kept for menu-drift tests added later.
 func settingsMenuData() []string {
 	var out []string
 	for _, r := range settingsMainMenu() {

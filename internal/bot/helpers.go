@@ -62,10 +62,16 @@ func withSig(base, sig string) string {
 	return base + "\n" + sig
 }
 
-// bg returns a background context bounded by dbOpTimeout, for a handler's
-// database work. Handlers call it for short-lived query groups.
+// bg returns a background context bounded by dbOpTimeoutInteractive, for a
+// handler's database work. Handlers call it for short-lived query groups.
+//
+// Interactive is the key word: the dispatcher is serial, so a handler's DB wait
+// blocks every other user's update. If PostgreSQL is wedged, a 30s bound here
+// stacked up into a multi-minute unresponsive bot; 5s fails the update, lets
+// handleErr report/classify it, and keeps the pipeline moving. Background jobs
+// (which nobody waits on) keep the larger budget — see dbOpTimeoutBackground.
 func (b *Bot) bg() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), dbOpTimeout)
+	return context.WithTimeout(context.Background(), dbOpTimeoutInteractive)
 }
 
 // replyText replies to the triggering message in plain text, quoting it — the

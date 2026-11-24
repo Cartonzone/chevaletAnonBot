@@ -15,12 +15,45 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/aturzone/chevaletAnonBot/internal/config"
+)
+
+// Pool limits. They are intentionally NOT libpq defaults: the previous code used
+// pgxpool's defaults (MaxConns = max(4, NumCPU)) which on a 2-vCPU container is 4
+// — too few for the hourly jobs plus handler traffic — and outside an operator's
+// control. Explicit values make the pool's footprint predictable on both the
+// production host and a kubernetes-style restart.
+const (
+	// defaultDBMaxConns is used when config carries no value (unit tests build a
+	// bare config.Config); config.Load already defaults DB_MAX_CONNS to 20.
+	defaultDBMaxConns = 20
+	// hardMaxDBMaxConns mirrors config's DB_MAX_CONNS ceiling. Repeated here so a
+	// caller constructing Config by hand can still never exceed it.
+	hardMaxDBMaxConns = 100
+	// defaultDBConnectTimeout mirrors config's DB_CONNECT_TIMEOUT_SECONDS default.
+	defaultDBConnectTimeout = 5 * time.Second
+)
+
+// Pool lifecycle: bound how long a connection may live/idle and how often the
+// background health check reaps bad ones. A long MaxConnLifetime makes a rolling
+// PostgreSQL restart (or a DNS change behind a load balancer) actually take
+// effect instead of pinning every pooled connection forever.
+const (
+	dbMinConns          = 1
+	dbMaxConnLifetime   = 30 * time.Minute
+	dbMaxConnIdleTime   = 15 * time.Minute
+	dbHealthCheckPeriod = 30 * time.Second
 )
 
 // IsUniqueViolation reports whether err is a Postgres unique-constraint
@@ -46,33 +79,142 @@ type DB struct {
 	defaultCIDLimit int
 	defaultAudioTag string
 	maxNameLength   int
+
+	// lastFailureNs is the UnixNano of the most recent recorded DB failure, 0 when
+	// healthy. It backs DegradedFor, the fast-fail circuit breaker that lets the
+	// request path skip work while PostgreSQL is known to be down (see
+	// MarkFailure/MarkSuccess). An atomic keeps the hot path lock-free: during an
+	// outage every update touches this, possibly concurrently.
+	lastFailureNs atomic.Int64
 }
 
-// Connect opens the pool (mirroring psycopg2's SimpleConnectionPool minconn=1,
-// maxconn=30) and verifies connectivity.
-func Connect(ctx context.Context, cfg *config.Config) (*DB, error) {
-	poolCfg, err := pgxpool.ParseConfig("")
-	if err != nil {
-		return nil, fmt.Errorf("db: parse config: %w", err)
+// MarkFailure records that the most recent database operation failed. It is
+// deliberately cheap and silent: during an outage the error path calls it for
+// every single update, so it must never log, block or allocate beyond the atomic
+// store.
+func (db *DB) MarkFailure() { db.lastFailureNs.Store(time.Now().UnixNano()) }
+
+// MarkSuccess records that a database operation just succeeded, clearing any
+// degraded state immediately.
+func (db *DB) MarkSuccess() { db.lastFailureNs.Store(0) }
+
+// DegradedFor reports whether the most recent recorded database outcome was a
+// failure less than d ago. d <= 0 reports false. It is the primitive a request
+// path can use to fail fast instead of waiting for another timeout while the
+// database is known to be unreachable; it deliberately has no recovery timer —
+// the first successful operation (or MarkSuccess) re-clears it.
+func (db *DB) DegradedFor(d time.Duration) bool {
+	if d <= 0 {
+		return false
 	}
-	// Set connection fields explicitly so passwords with special characters
-	// never need DSN escaping.
+	ns := db.lastFailureNs.Load()
+	if ns == 0 {
+		return false
+	}
+	return time.Since(time.Unix(0, ns)) < d
+}
+
+// Ping verifies the pool can reach PostgreSQL within ctx. It is used by startup,
+// the health readiness probe and the watchdog; it does NOT touch the degraded
+// state (that is driven by real query outcomes, see MarkFailure/MarkSuccess).
+func (db *DB) Ping(ctx context.Context) error {
+	if db == nil || db.pool == nil {
+		return errors.New("db: not connected")
+	}
+	return db.pool.Ping(ctx)
+}
+
+// buildConnString renders the connection as a libpq-style URL.
+//
+// WHY A URL rather than assigning ConnConfig fields: url.UserPassword escapes the
+// password (and the database name the URL parser escapes in the path), so a
+// password containing '@', ':', '/', '?' or '#' no longer needs hand-rolled DSN
+// quoting — the old field-assignment path only worked for "safe" secrets. The
+// remaining parameters are the ones that must be explicit rather than inherited
+// from an ambient PG* environment variable: the TLS mode, the client encoding
+// (the Persian texts are UTF-8; a server/locale defaulting to SQL_ASCII would
+// mangle them), a recognizable application_name (pgsql monitoring/locks), and a
+// per-attempt connect_timeout so a dropped host cannot hang a dial for minutes.
+func buildConnString(cfg *config.Config) string {
 	port := cfg.DBPort
 	if port == 0 {
 		port = 5432
 	}
-	poolCfg.ConnConfig.Host = cfg.DBHost
-	poolCfg.ConnConfig.Port = uint16(port)
-	poolCfg.ConnConfig.User = cfg.DBUser
-	poolCfg.ConnConfig.Password = cfg.DBPass
-	poolCfg.ConnConfig.Database = cfg.DBName
-	if poolCfg.ConnConfig.RuntimeParams == nil {
-		poolCfg.ConnConfig.RuntimeParams = map[string]string{}
+	host := cfg.DBHost
+	if host == "" {
+		host = "localhost"
 	}
-	poolCfg.ConnConfig.RuntimeParams["client_encoding"] = "UTF8"
-	poolCfg.MaxConns = 30
-	poolCfg.MinConns = 1
+	sslmode := strings.ToLower(strings.TrimSpace(cfg.DBSSLMode))
+	if sslmode == "" {
+		sslmode = "prefer" // libpq/pgx default; the pre-hardening behaviour
+	}
+	timeout := cfg.DBConnectTimeout
+	if timeout <= 0 {
+		timeout = defaultDBConnectTimeout
+	}
 
+	u := url.URL{
+		Scheme: "postgres",
+		User:   url.UserPassword(cfg.DBUser, cfg.DBPass),
+		Host:   net.JoinHostPort(host, strconv.Itoa(port)),
+	}
+	if cfg.DBName != "" {
+		// The URL parser percent-escapes the path, and pgx unescapes it again, so a
+		// database name with unusual characters survives too.
+		u.Path = "/" + cfg.DBName
+	}
+	q := url.Values{}
+	q.Set("sslmode", sslmode)
+	q.Set("client_encoding", "UTF8")
+	q.Set("application_name", "chevalet-bot")
+	q.Set("connect_timeout", strconv.Itoa(int(timeout/time.Second)))
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+// poolConfig parses the connection URL and applies the explicit pool limits.
+// Split from Connect so the connection parameters can be unit-tested without a
+// live PostgreSQL.
+func poolConfig(cfg *config.Config) (*pgxpool.Config, error) {
+	poolCfg, err := pgxpool.ParseConfig(buildConnString(cfg))
+	if err != nil {
+		return nil, fmt.Errorf("db: parse config: %w", err)
+	}
+	maxConns := cfg.DBMaxConns
+	if maxConns <= 0 {
+		maxConns = defaultDBMaxConns
+	}
+	if maxConns > hardMaxDBMaxConns {
+		maxConns = hardMaxDBMaxConns
+	}
+	poolCfg.MaxConns = int32(maxConns)
+	poolCfg.MinConns = dbMinConns
+	poolCfg.MaxConnLifetime = dbMaxConnLifetime
+	poolCfg.MaxConnIdleTime = dbMaxConnIdleTime
+	poolCfg.HealthCheckPeriod = dbHealthCheckPeriod
+	// connect_timeout in the URL is parsed by pgx into ConnConfig.ConnectTimeout
+	// already; re-assert it so a future refactor of the URL cannot drop the bound.
+	poolCfg.ConnConfig.ConnectTimeout = timeoutFromConfig(cfg)
+	return poolCfg, nil
+}
+
+// timeoutFromConfig returns the per-attempt connect timeout, defaulting when the
+// caller passes a bare config.
+func timeoutFromConfig(cfg *config.Config) time.Duration {
+	if cfg.DBConnectTimeout > 0 {
+		return cfg.DBConnectTimeout
+	}
+	return defaultDBConnectTimeout
+}
+
+// Connect opens the pool and verifies connectivity. The pool shape mirrors
+// psycopg2's SimpleConnectionPool (minconn=1) except that the ceiling is
+// operator-controlled: DB_MAX_CONNS, default 20, hard-capped at 100.
+func Connect(ctx context.Context, cfg *config.Config) (*DB, error) {
+	poolCfg, err := poolConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return nil, fmt.Errorf("db: connect: %w", err)

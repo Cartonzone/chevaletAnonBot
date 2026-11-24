@@ -1,11 +1,11 @@
 package bot
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
+	"time"
 
 	"github.com/PaulSonOfLars/gotgbot/v2"
 	"github.com/PaulSonOfLars/gotgbot/v2/ext"
@@ -58,6 +58,15 @@ func ignoredChat(ec *gotgbot.Chat, gmGroupID string) bool {
 	return gmGroupID != "" && strconv.FormatInt(ec.Id, 10) == gmGroupID
 }
 
+// dbFastFailWindow is how long one "database unavailable" failure suppresses all
+// further database work in prep. During the 2026-11-23 storage stall the serial
+// dispatcher (MaxRoutines:1) queued updates behind a 30 s DB deadline: each one
+// then waited out its own timeout, so the queue could never drain and the bot
+// looked dead. Fast-failing for this window keeps the queue moving (users get the
+// same "database problem" notice) while the DB is known to be unreachable; after
+// it, the next update probes the DB again and a success clears the state.
+const dbFastFailWindow = 30 * time.Second
+
 // prep wraps a Handler with the middleware from modules/Global/decorators.py
 // (@prep_function): it filters out non-private and edited updates, initialises
 // the user (row, a cid, a chevaletid), rejects banned users, then dispatches.
@@ -76,6 +85,31 @@ func (b *Bot) prep(fn Handler) handlers.Response {
 
 		userid := strconv.FormatInt(ctx.EffectiveUser.Id, 10)
 
+		// Fast-fail while the database is known to be down (see dbFastFailWindow):
+		// answer with the ordinary DB-problem text and skip every DB round-trip, so
+		// a stalled database cannot serialise the whole update queue behind timeouts.
+		// Placed before the per-user mutex on purpose — no point locking.
+		//
+		// A callback query is answered HERE and only here (M-6), never for every
+		// update at prep entry: Telegram's second answerCallbackQuery is not reliably
+		// accepted, so a blanket pre-answer would swallow the handlers' own popups
+		// (block/seen/report/settings alerts) in NORMAL operation — a user-visible
+		// regression. The fast-fail path is exactly the stall that used to let a tap
+		// expire: the handler never runs, so without this answer the spinner would
+		// hang. (The interactive DB budget, b.bg, is 5 s — inside Telegram's ~10 s
+		// callback window — and the first failure keeps this branch active for
+		// dbFastFailWindow, so every following tap is answered immediately.)
+		if b.DB.DegradedFor(dbFastFailWindow) {
+			slog.Debug("database degraded; fast-failing update without DB work", "user", userid)
+			if ctx.CallbackQuery != nil {
+				_, _ = ctx.CallbackQuery.Answer(tg, nil)
+			}
+			if ctx.EffectiveMessage != nil {
+				_, _ = ctx.EffectiveMessage.Reply(tg, txtDBProblem, nil)
+			}
+			return nil
+		}
+
 		// Serialise this user's updates (mirrors PTB's effectively per-user
 		// processing and keeps media-group state race-free). Released when the
 		// handler returns.
@@ -83,7 +117,11 @@ func (b *Bot) prep(fn Handler) handlers.Response {
 		ud.mu.Lock()
 		defer ud.mu.Unlock()
 
-		dbctx, cancel := context.WithTimeout(context.Background(), dbOpTimeout)
+		// The INTERACTIVE DB budget (b.bg): the dispatcher is serial, so time spent
+		// waiting on PostgreSQL here is every other user's update waiting too. A
+		// wedged DB fails the update at 5 s (handleErr then classifies it and trips
+		// the fast-fail gate) instead of stacking 30 s waits into a dead pipeline.
+		dbctx, cancel := b.bg()
 		defer cancel()
 
 		if err := b.initUser(dbctx, userid, ctx.EffectiveUser); err != nil {
@@ -104,6 +142,9 @@ func (b *Bot) prep(fn Handler) handlers.Response {
 		if err != nil {
 			return b.handleErr(tg, ctx, err)
 		}
+		// Both mandatory reads of this update succeeded, so the database is
+		// answering: clear any fast-fail state recorded by an earlier failure.
+		b.DB.MarkSuccess()
 		if banned {
 			return nil // banned users are silently ignored, as in the original
 		}
@@ -122,11 +163,15 @@ func (b *Bot) prep(fn Handler) handlers.Response {
 // handleErr mirrors the except blocks of @prep_function, which wrapped every
 // handler. In order, it:
 //   - lets conversation state changes through untouched;
+//   - swallows a context cancellation (the process is shutting down: an in-flight
+//     DB/API call was cancelled, which is not a bug and not reportable);
 //   - swallows the benign Telegram errors PTB ignored (an old callback query, a
 //     vanished reply target, a Forbidden from a user who blocked the bot, or a
 //     "message is not modified" from re-triggering a menu already showing);
 //   - on a database error, replies the "database problem" notice to the user and
-//     reports it to ERROR_CHAT_ID (decorators.py `except psycopg2.Error`);
+//     reports it to ERROR_CHAT_ID (decorators.py `except psycopg2.Error`), with the
+//     channel text REDACTED down to a category (errSummary) and the fast-fail gate
+//     told when the database — not just one query — is unavailable;
 //   - on a Telegram transport/network error, replies the "internet problem"
 //     notice (decorators.py `except NetworkError`);
 //   - propagates everything else to the central error hook (onError), which —
@@ -144,6 +189,13 @@ func (b *Bot) handleErr(tg *gotgbot.Bot, ctx *ext.Context, err error) error {
 		return err
 	}
 	switch {
+	case isContextCanceled(err):
+		// Shutdown, not a fault: the run context was cancelled while a DB or
+		// Telegram call was in flight. There is nothing to fix, the process is
+		// going down (so a channel report may not even be deliverable), and filing
+		// an incident per in-flight update would only add noise.
+		slog.Debug("swallowed a canceled operation during shutdown", "err", err)
+		return nil
 	case errQueryTooOld(err):
 		return nil
 	case errReplyNotFound(err):
@@ -187,13 +239,24 @@ func (b *Bot) handleErr(tg *gotgbot.Bot, ctx *ext.Context, err error) error {
 		return nil
 
 	case isDBError(err):
+		// Tell the fast-fail gate when the DATABASE, not just one query, is
+		// unavailable (timeout / failed connection): the next updates then skip DB
+		// work for dbFastFailWindow instead of each waiting out the full timeout. A
+		// PgError (the server answered) intentionally does not trip it.
+		if isDBUnavailable(err) {
+			b.DB.MarkFailure()
+		}
+		// The full error belongs in the process logs (operators read those); only
+		// the redacted category may go to the Telegram channel — a pgx ConnectError
+		// embeds user/database/host in its message (M-8).
+		slog.Error("database error", "err", err)
 		if ctx.EffectiveMessage != nil {
 			_, _ = ctx.EffectiveMessage.Reply(tg, txtDBProblem, nil)
 		}
 		// Throttle the channel report (coalesce a DB-outage flood); the per-update
 		// user reply above is unaffected.
 		if b.allowDBErrReport() {
-			b.reportToErrorChat(tg, "PostgreSQL ERROR: "+err.Error())
+			b.reportToErrorChat(tg, "PostgreSQL ERROR: "+errSummary(err))
 		}
 		return nil
 	case isNetworkError(err):

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/PaulSonOfLars/gotgbot/v2"
 	"github.com/PaulSonOfLars/gotgbot/v2/ext"
@@ -304,17 +305,29 @@ func (b *Bot) adminReport(ctx *ext.Context, dbctx context.Context, text []string
 	return nil
 }
 
-// adminBackup ports the /admin backup branch: send the newest file in backups/.
-// Selection is by mtime via latestBackupFile (shared with the nightly job); the
-// original plain name sort could be fooled by a differently-prefixed file into
-// returning a stale dump.
+// adminBackupMinAge is the minimum age of a backup file the manual /admin backup
+// command will send. backup.sh gzips straight into the final filename (no
+// temp+rename), so the newest *.sql.gz may be a dump still being written —
+// shipping it would send a truncated archive Telegram accepts and the admin
+// believes is a backup. The manual command used 0 ("newest right now"), which is
+// exactly the in-flight window; 60s makes it as safe as the nightly path, at the
+// cost of an admin needing to wait a moment after a fresh dump.
+const adminBackupMinAge = 60 * time.Second
+
+// adminBackup ports the /admin backup branch: send the newest settled file in
+// backups/. Selection is by mtime via latestBackupFile (shared with the nightly
+// job); the original plain name sort could be fooled by a differently-prefixed
+// file into returning a stale dump.
 func (b *Bot) adminBackup(tg *gotgbot.Bot, ctx *ext.Context) error {
-	latest, err := latestBackupFile("backups", 0) // 0 = newest right now (manual command)
+	latest, err := latestBackupFile("backups", adminBackupMinAge)
 	if err != nil {
 		return err
 	}
 	if latest == "" {
-		return errWrongSyntax // no backup yet -> Python's backups[-1] IndexError path
+		// No eligible file: either backups/ is empty or the only files are younger
+		// than adminBackupMinAge (a dump in progress). Say so instead of the old
+		// misleading "wrong syntax".
+		return b.replyText(ctx, "no settled backup file yet (the newest *.sql.gz must be at least 60s old)")
 	}
 	f, err := os.Open(filepath.Join("backups", latest))
 	if err != nil {

@@ -123,6 +123,78 @@ type chatBucket struct {
 	seen   time.Time
 }
 
+// PollStatus is a snapshot of the long-polling loop's activity. The bot exposes it
+// (Bot.PollStatus) so the health endpoints and the watchdog can tell a working
+// bot from one whose getUpdates has wedged: a process can be alive while Telegram
+// updates have silently stopped arriving, which the old TCP health probe could
+// never see.
+type PollStatus struct {
+	// Started is when polling began (zero before Run).
+	Started time.Time
+	// LastAttempt is when the most recent getUpdates was issued.
+	LastAttempt time.Time
+	// LastSuccess is when a getUpdates last returned without an error. THIS is the
+	// liveness signal: a long-poll that is still in flight keeps LastAttempt fresh
+	// but does not prove updates are arriving.
+	LastSuccess time.Time
+	// LastError is when a getUpdates last failed.
+	LastError time.Time
+}
+
+// pollTracker records the polling timestamps above. It lives on the limiter
+// because the limiter is the single choke point every API call (getUpdates
+// included) already passes through.
+type pollTracker struct {
+	mu          sync.Mutex
+	started     time.Time
+	lastAttempt time.Time
+	lastSuccess time.Time
+	lastError   time.Time
+}
+
+// start records when polling was started.
+func (p *pollTracker) start(t time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.started = t
+}
+
+// attempt records a getUpdates call that is about to be made.
+func (p *pollTracker) attempt(t time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.lastAttempt = t
+}
+
+// success records a getUpdates that came back without an error.
+func (p *pollTracker) success(t time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.lastAttempt = t
+	p.lastSuccess = t
+}
+
+// failure records a getUpdates that returned an error (a network blip, a proxy
+// timeout, a Telegram 5xx) — the updater retries, so this is diagnostic, not fatal.
+func (p *pollTracker) failure(t time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.lastAttempt = t
+	p.lastError = t
+}
+
+// status returns a consistent snapshot.
+func (p *pollTracker) status() PollStatus {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return PollStatus{
+		Started:     p.started,
+		LastAttempt: p.lastAttempt,
+		LastSuccess: p.lastSuccess,
+		LastError:   p.lastError,
+	}
+}
+
 // sendLimiter paces outbound calls and owns the Telegram-imposed flood pause.
 type sendLimiter struct {
 	mu         sync.Mutex
@@ -130,6 +202,11 @@ type sendLimiter struct {
 	perChat    map[int64]*chatBucket
 	floodUntil time.Time
 	lastReport time.Time
+
+	// poll tracks the getUpdates loop for the health endpoints/watchdog. It is
+	// always non-nil after newSendLimiter, but the request path still guards
+	// against a hand-built limiter in tests.
+	poll *pollTracker
 
 	// Injectable for tests: real time makes rate-limit tests slow and flaky.
 	now   func() time.Time
@@ -140,6 +217,7 @@ func newSendLimiter() *sendLimiter {
 	return &sendLimiter{
 		global:  newTokenBucket(globalBurst, globalRatePerSec),
 		perChat: make(map[int64]*chatBucket),
+		poll:    &pollTracker{},
 		now:     time.Now,
 		sleep:   sleepCtx,
 	}
@@ -292,6 +370,20 @@ func (c *limitedClient) RequestWithContext(
 	ctx context.Context, token, method string, params map[string]any, opts *gotgbot.RequestOpts,
 ) (json.RawMessage, error) {
 	if unlimitedMethods[method] {
+		// getUpdates is NOT paced (throttling the poll loop would stall the bot),
+		// but it IS observed: the poll timestamps feed /healthz and the watchdog.
+		// The tracker is attached to the limiter; a hand-built client in a test
+		// without one simply goes untracked.
+		if method == "getUpdates" && c.limiter != nil && c.limiter.poll != nil {
+			c.limiter.poll.attempt(time.Now())
+			raw, err := c.inner.RequestWithContext(ctx, token, method, params, opts)
+			if err != nil {
+				c.limiter.poll.failure(time.Now())
+			} else {
+				c.limiter.poll.success(time.Now())
+			}
+			return raw, err
+		}
 		return c.inner.RequestWithContext(ctx, token, method, params, opts)
 	}
 

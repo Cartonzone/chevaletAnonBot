@@ -141,7 +141,9 @@ func (b *Bot) setCommands() {
 // manual reconnect dance.
 func (b *Bot) checkConnectionLoop(ctx context.Context) {
 	check := func() {
-		c, cancel := context.WithTimeout(ctx, dbOpTimeout)
+		// Background budget: nobody is waiting on this probe, so it may take the
+		// full 30s before being recorded as a failure.
+		c, cancel := context.WithTimeout(ctx, dbOpTimeoutBackground)
 		defer cancel()
 		if _, err := b.DB.UserCount(c); err != nil {
 			slog.Error("error while checking connection", "err", err)
@@ -320,6 +322,25 @@ func (b *Bot) backupLoop(ctx context.Context, hm [2]int, chatID int64) {
 // latestBackupFile). An older hourly backup always exists, so this never starves.
 const backupMinAge = 3 * time.Minute
 
+// backupStaleAfter is the age beyond which the nightly job REFUSES to send the
+// newest dump and instead reports a failure to the configured chat.
+//
+// WHY: sending a day-old file successfully looks exactly like a healthy nightly
+// backup — the operator sees the message, the marker is touched, the host-side
+// backstop considers the night covered — while the real dump pipeline has been
+// dead for hours. The whole point of the delivery job is to prove fresh dumps
+// exist, so a stale file is a FAILURE, not a fallback.
+const backupStaleAfter = 2 * time.Hour
+
+// backupFileAge returns how old the named backup file in dir is (by mtime).
+func backupFileAge(dir, name string) (time.Duration, error) {
+	info, err := os.Stat(filepath.Join(dir, name))
+	if err != nil {
+		return 0, err
+	}
+	return time.Since(info.ModTime()), nil
+}
+
 // nightlySentMarker is (re)written to the backups dir after a successful
 // nightly send. deploy/go/nightly-backup-backstop.sh — a host-side cron that
 // re-sends the backup if this job silently failed — checks this file's mtime
@@ -350,6 +371,23 @@ func (b *Bot) sendLatestBackupTo(chatID int64) {
 		b.notifyBackupFail(chatID, "فایلِ بکاپی پیدا نشد")
 		return
 	}
+	// Staleness guard: a 2h+ old "newest" dump means the hourly backup pipeline is
+	// broken. Sending it would make the night look successful and hide the fault,
+	// so this fails LOUDLY (log + chat notice) instead.
+	age, aerr := backupFileAge("backups", latest)
+	if aerr != nil {
+		slog.Warn("nightly backup: cannot stat newest file", "file", latest, "err", aerr)
+		b.notifyBackupFail(chatID, "خواندنِ فایلِ بکاپ ناموفق بود")
+		return
+	}
+	if age > backupStaleAfter {
+		slog.Error("nightly backup: newest dump is stale; refusing to send it",
+			"file", latest, "age", age.Round(time.Minute), "limit", backupStaleAfter)
+		b.notifyBackupFail(chatID, fmt.Sprintf(
+			"آخرین فایلِ بکاپ (%s) بیش از %d ساعت قدمت دارد؛ تازه نیست و ارسال نشد. cronِ بکاپ پیکربندی/اجرا را بررسی کن.",
+			latest, int(backupStaleAfter/time.Hour)))
+		return
+	}
 	f, err := os.Open(filepath.Join("backups", latest))
 	if err != nil {
 		slog.Warn("nightly backup: open failed", "file", latest, "err", err)
@@ -357,8 +395,10 @@ func (b *Bot) sendLatestBackupTo(chatID int64) {
 		return
 	}
 	defer f.Close()
+	slog.Info("nightly backup: sending", "file", latest, "age", age.Round(time.Minute))
 	// A DB dump can outgrow the 10s default request timeout as the data grows;
-	// give the upload its own generous budget so it scales with the file.
+	// give the upload its own generous budget so it scales with the file. This is
+	// the ONLY call in the bot with a budget that large.
 	if _, err := b.TG.SendDocument(chatID, gotgbot.InputFileByReader(latest, f),
 		&gotgbot.SendDocumentOpts{
 			Caption:     "🌙 بکاپِ خودکارِ شبانه‌ی دیتابیس — " + latest,
@@ -514,7 +554,7 @@ func (b *Bot) sendMassMsg(msg *gotgbot.Message) {
 	rctx := b.runCtx
 	_, _ = msg.Reply(b.TG, "starting to send mass msg...", nil)
 
-	dbctx, cancel := context.WithTimeout(rctx, dbOpTimeout)
+	dbctx, cancel := context.WithTimeout(rctx, dbOpTimeoutBackground)
 	uids, err := b.DB.GetAllUIDs(dbctx)
 	cancel()
 	if err != nil {

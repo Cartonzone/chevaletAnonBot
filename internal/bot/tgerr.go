@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"context"
 	"errors"
 	"net/url"
 	"strconv"
@@ -66,17 +67,106 @@ func errForbidden(err error) bool {
 
 // isDBError reports whether err is a PostgreSQL/database failure, mirroring the
 // Python prep's `except (psycopg2.Error, psycopg2.DatabaseError)`: a server-side
-// SQL error (PgError) or a failure to establish a connection (ConnectError).
-// Both warrant the user-facing "database problem" reply and an ERROR_CHAT_ID
-// report. (A clean separation from isNetworkError: DB failures are pgconn types,
-// never a *url.Error.)
+// SQL error (PgError) or a failure to reach/use the database (see
+// isDBUnavailable). Both warrant the user-facing "database problem" reply and an
+// ERROR_CHAT_ID report. (A clean separation from isNetworkError: DB failures are
+// pgconn/pgx types, never a *url.Error.)
 func isDBError(err error) bool {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
 		return true
 	}
+	return isDBUnavailable(err)
+}
+
+// isDBUnavailable reports whether err means the database is UNREACHABLE or not
+// answering — as opposed to a PgError, which is the server answering with an
+// error (a bad statement, a constraint violation) and so proves the connection
+// is alive.
+//
+// Why this distinction exists (the 2026-11-23 incident): a storage-I/O stall made
+// established connections hit the caller's 30 s deadline. pgx returns that as its
+// internal *errTimeout ("timeout: context deadline exceeded") — neither a PgError
+// nor a ConnectError — and pgxpool.Acquire returns a bare context.DeadlineExceeded
+// when it cannot hand out a connection in time. isDBError used to match only the
+// two exported pgconn types, so both classes fell through handleErr's default
+// branch into onError: one UNTHROTTLED incident report plus a tracking-code reply
+// for every failing update — the error-channel flood the audit investigated (C-1).
+//
+// It is deliberately NOT "every DB error": a unique-violation or SQL error must
+// not trip the bot's fast-fail gate (db.DegradedFor), because the database is
+// demonstrably working and retrying other users' unrelated updates would hurt.
+func isDBUnavailable(err error) bool {
+	// A server-side PgError is normally proof the connection is alive — EXCEPT for
+	// the connection-exception SQLSTATE class: class 08 (connection exception) and
+	// the admin/shutdown 57P0x codes mean the established connection is going away
+	// (e.g. a planned PostgreSQL restart), so the next updates should fast-fail
+	// rather than each waiting out an interactive timeout. Ordinary SQL errors
+	// (unique violation, bad statement, ...) deliberately do NOT match.
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch {
+		case strings.HasPrefix(pgErr.Code, "08"):
+			return true
+		case pgErr.Code == "57P01", pgErr.Code == "57P02", pgErr.Code == "57P03":
+			// admin shutdown / crash shutdown / cannot connect now
+			return true
+		}
+		return false
+	}
+	// *pgconn.ConnectError: the attempt to open a connection failed (DNS lookup,
+	// dial, TLS, authentication) — the database is effectively down for us.
 	var connErr *pgconn.ConnectError
-	return errors.As(err, &connErr)
+	if errors.As(err, &connErr) {
+		return true
+	}
+	// pgconn.Timeout matches the unexported *errTimeout (the incident's exact
+	// "timeout: context deadline exceeded") anywhere in the wrap chain.
+	if pgconn.Timeout(err) {
+		return true
+	}
+	// A bare ctx deadline is pgxpool.Acquire returning ctx.Err() unchanged. It is
+	// only a DB symptom when it did not come from net/http: an HTTP timeout is a
+	// *url.Error wrapping the same sentinel and belongs to isNetworkError.
+	if isNetworkError(err) {
+		return false
+	}
+	return errors.Is(err, context.DeadlineExceeded)
+}
+
+// isContextCanceled reports whether err is a context CANCELLATION (not a
+// deadline) — in this bot that is the shutdown path: Run's context is cancelled,
+// in-flight DB/API calls fail with context.Canceled, and every one of them would
+// otherwise be filed as an incident while the process is going down (a report
+// that usually cannot even be delivered). handleErr swallows it as a no-op.
+func isContextCanceled(err error) bool {
+	return errors.Is(err, context.Canceled)
+}
+
+// errSummary is the short, REDACTED category for a database error that is sent to
+// Telegram's ERROR_CHAT_ID. The full error string goes to the process logs only.
+//
+// Why (M-8): handleErr used to paste "PostgreSQL ERROR: " + err.Error() into the
+// error channel. pgx's ConnectError renders its config — "failed to connect to
+// `user=root database=mydatabase`: hostname resolving error: lookup
+// telegram-bot-db on 127.0.0.11:53: … connection refused" — so an infrastructure
+// hiccup published the DB user/database/host and Docker DNS internals to everyone
+// who can read that channel, which is typically wider than the ops team. The
+// SQLSTATE is the only server detail worth surfacing: it identifies the class of
+// failure without any row data, query text or connection string.
+func errSummary(err error) string {
+	var connErr *pgconn.ConnectError
+	if errors.As(err, &connErr) {
+		return "database connection/DNS failure"
+	}
+	if pgconn.Timeout(err) || errors.Is(err, context.DeadlineExceeded) {
+		return "database timeout"
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code != "" {
+		return "SQLSTATE " + pgErr.Code
+	}
+	return "database error"
 }
 
 // isNetworkError reports whether err is a transport-level failure talking to

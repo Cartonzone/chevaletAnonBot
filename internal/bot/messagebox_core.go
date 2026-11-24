@@ -446,6 +446,9 @@ func quotePositionForBox(m *gotgbot.Message) int64 {
 // boxReplyChat is the chat id the stored message replied to: an external
 // channel/group message when present, otherwise the recipient's own chat (the
 // normal "answer" case — the receiver's earlier message lives there).
+// yet (CODE-AUDIT backlog).
+//
+//lint:ignore U1000 retained helper for the message-box reply target; not wired
 func boxReplyChat(targetUID, targetMid string, externalReply *gotgbot.ExternalReplyInfo) int64 {
 	if externalReply != nil && externalReply.Chat != nil {
 		return externalReply.Chat.Id
@@ -458,6 +461,9 @@ func boxReplyChat(targetUID, targetMid string, externalReply *gotgbot.ExternalRe
 }
 
 // boxReplyMID is the message id the stored message replied to.
+// yet (CODE-AUDIT backlog).
+//
+//lint:ignore U1000 retained helper for the message-box reply target; not wired
 func boxReplyMID(targetMid string, externalReply *gotgbot.ExternalReplyInfo) int64 {
 	if externalReply != nil {
 		return externalReply.MessageId

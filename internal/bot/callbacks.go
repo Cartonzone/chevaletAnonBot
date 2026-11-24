@@ -28,9 +28,12 @@ func answer(b *Bot, tg *gotgbot.Bot, ctx *ext.Context, userid string) error {
 	// The reverse of the settings case: someone part-way through renaming themselves
 	// who taps "answer" must not have their reply captured by the settings state.
 	b.dropConversations(ctx)
-	if _, err := clbk.Answer(tg, nil); err != nil {
-		return err
-	}
+	// Answer, but ignore the error: an answer that lands after Telegram's ~10 s
+	// callback window ("query is too old") or on a transport hiccup says nothing
+	// about the action itself — returning it would turn a benign stale tap into a
+	// handler error. (Only prep's DB-degraded fast-fail path answers centrally,
+	// because it skips the handler altogether; see prep.go.)
+	_, _ = clbk.Answer(tg, nil)
 	parts := strings.Split(clbk.Data, "|")
 	if len(parts) < 3 {
 		return nil
@@ -278,9 +281,9 @@ func report(b *Bot, tg *gotgbot.Bot, ctx *ext.Context, _ string) error {
 	if clbk == nil || clbk.Data == "" {
 		return nil
 	}
-	if _, err := clbk.Answer(tg, nil); err != nil {
-		return err
-	}
+	// Answer, but ignore the error — a failed answer is not a failed report (see
+	// the note in answer()).
+	_, _ = clbk.Answer(tg, nil)
 	parts := strings.Split(clbk.Data, "|")
 	if len(parts) < 3 {
 		return nil
@@ -316,9 +319,9 @@ func reportConfirmYes(b *Bot, tg *gotgbot.Bot, ctx *ext.Context, userid string) 
 	if clbk == nil || clbk.Data == "" {
 		return nil
 	}
-	if _, err := clbk.Answer(tg, nil); err != nil {
-		return err
-	}
+	// Answer, but ignore the error — a failed answer is not a failed report (see
+	// the note in answer()).
+	_, _ = clbk.Answer(tg, nil)
 	parts := strings.Split(clbk.Data, "|")
 	if len(parts) < 3 {
 		return nil

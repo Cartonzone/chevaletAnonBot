@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"html"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"runtime/debug"
@@ -26,8 +27,52 @@ import (
 	"github.com/aturzone/chevaletAnonBot/internal/texts"
 )
 
-// dbOpTimeout bounds a single update's database work.
-const dbOpTimeout = 30 * time.Second
+// Database timeouts, split by who is waiting.
+//
+// dbOpTimeoutInteractive bounds a HANDLER's database work: the dispatcher runs
+// with MaxRoutines=1, so every second spent waiting on the DB is a second every
+// other user's update waits behind it. A wedged database would otherwise stack
+// twenty 30-second waits into a ten-minute unresponsive bot — exactly the failure
+// mode the watchdog exists to catch.
+//
+// dbOpTimeoutBackground bounds a background job's database work (connection
+// check, mass broadcast), where nobody is waiting on an interactive reply and a
+// bigger budget is harmless.
+const (
+	dbOpTimeoutInteractive = 5 * time.Second
+	dbOpTimeoutBackground  = 30 * time.Second
+
+	// dbOpTimeout is the OLD single name. It stays as an alias for background-path
+	// call sites that were not part of the interactive-timeout split (outbox
+	// replay, box flush) so their behaviour is unchanged; handler code should use
+	// dbOpTimeoutInteractive (via b.bg()).
+	dbOpTimeout = dbOpTimeoutBackground
+
+	// Telegram request budgets. DefaultRequestOpts applies to EVERY API call;
+	// 10s is long enough for a normal send through the production proxy and short
+	// enough to fail a dead connection instead of stalling the serial dispatcher.
+	// The old code raised it to 30s whenever PROXY was set, which turned one slow
+	// proxy into a 30-second pipeline stall per update.
+	telegramRequestTimeout = 10 * time.Second
+	// Per-call budgets are explicit, so the transport-level timeouts below only
+	// need to be generous upper bounds (the request context is the real limit).
+	telegramDialTimeout           = 5 * time.Second
+	telegramTLSHandshakeTimeout   = 10 * time.Second
+	telegramResponseHeaderTimeout = 30 * time.Second
+
+	// Shutdown phase bounds: the updater first (so no new update is dispatched),
+	// then the delivery batcher (flush what was buffered), then background work
+	// (drain before the DB pool closes). Each is bounded so one hung Telegram call
+	// cannot make SIGTERM hang forever; compose gives the container 60s total.
+	shutdownUpdaterTimeout    = 10 * time.Second
+	shutdownBatcherTimeout    = 10 * time.Second
+	shutdownBackgroundTimeout = 10 * time.Second
+
+	// incidentWindow throttles the ERROR_CHAT_ID/user tracking-code replies. A
+	// broken handler can fire thousands of times a minute; each incident used to
+	// cost two MORE Telegram sends on a bot already in trouble.
+	incidentWindow = 30 * time.Second
+)
 
 // Bot bundles everything a handler needs.
 type Bot struct {
@@ -74,6 +119,14 @@ type Bot struct {
 	dbErrMu   sync.Mutex
 	lastDBErr time.Time
 
+	// incidentMu/lastIncidentAt/suppressedIncidents throttle the tracking-code
+	// incident reports (ERROR_CHAT_ID + user reply) shared by onError/onPanic.
+	// See beginIncident: at most one incident message per incidentWindow, with the
+	// suppressed count folded into the next one.
+	incidentMu          sync.Mutex
+	lastIncidentAt      time.Time
+	suppressedIncidents int
+
 	// bgWG tracks background goroutines (AI loop, GM/GN, an in-flight mass-msg) so
 	// Run can drain them on shutdown before the DB pool is closed; runCtx is the
 	// run-scoped context they derive from.
@@ -115,33 +168,67 @@ func (b *Bot) allowDBErrReport() bool {
 	return true
 }
 
+// newTelegramTransport builds the HTTP transport for every Telegram API call.
+//
+// The explicit timeouts are the H-6 fix: previously, with PROXY set, the client
+// was a bare http.Transport with NO dial/TLS/response timeouts and a 30s
+// DefaultRequestOpts. A dead proxy therefore parked each request for up to 30s
+// (the dispatcher is serial, so the whole bot stalled with it) and a hanging TLS
+// handshake had no bound at all. The per-request context remains the real
+// deadline; these are the transport-level backstops.
+func newTelegramTransport(proxy *url.URL) *http.Transport {
+	return &http.Transport{
+		// http.ProxyURL(nil) is a valid "no proxy" function, so the same transport
+		// shape is used whether or not PROXY is configured.
+		Proxy: http.ProxyURL(proxy),
+		DialContext: (&net.Dialer{
+			Timeout:   telegramDialTimeout,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          64,
+		MaxIdleConnsPerHost:   16,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   telegramTLSHandshakeTimeout,
+		ResponseHeaderTimeout: telegramResponseHeaderTimeout,
+		ExpectContinueTimeout: time.Second,
+	}
+}
+
+// newTelegramBotClient builds the gotgbot BotClient shared by every API call.
+// Split out of New so the timeout contract (H-6: 10s default even when PROXY is
+// set) is directly testable without a live Telegram token.
+func newTelegramBotClient(proxy *url.URL) *gotgbot.BaseBotClient {
+	return &gotgbot.BaseBotClient{
+		Client:             http.Client{Transport: newTelegramTransport(proxy)},
+		DefaultRequestOpts: &gotgbot.RequestOpts{Timeout: telegramRequestTimeout},
+	}
+}
+
 // New builds the Telegram bot, dispatcher and updater, and registers handlers.
 func New(cfg *config.Config, database *db.DB, txt *texts.Loader) (*Bot, error) {
 	limiter := newSendLimiter()
 
-	botOpts := &gotgbot.BotOpts{
-		RequestOpts: &gotgbot.RequestOpts{Timeout: 10 * time.Second},
-	}
+	var proxyURL *url.URL
 	if cfg.Proxy != "" {
 		u, err := url.Parse(cfg.Proxy)
 		if err != nil {
 			return nil, fmt.Errorf("bot: invalid PROXY %q: %w", cfg.Proxy, err)
 		}
-		botOpts.BotClient = &gotgbot.BaseBotClient{
-			Client: http.Client{
-				Transport: &http.Transport{Proxy: http.ProxyURL(u)},
-			},
-			DefaultRequestOpts: &gotgbot.RequestOpts{Timeout: 30 * time.Second},
-		}
+		proxyURL = u
+	}
+	// DefaultRequestOpts applies to every call: 10s is enough through the proxy and,
+	// unlike the old 30s, cannot stall the serial dispatcher for half a minute.
+	// Individual calls raise it where genuinely needed (the nightly backup upload
+	// passes its own 120s RequestOpts).
+	botOpts := &gotgbot.BotOpts{
+		RequestOpts: &gotgbot.RequestOpts{Timeout: telegramRequestTimeout},
+		BotClient:   newTelegramBotClient(proxyURL),
 	}
 
 	// Every API call goes through the limiter — including the ones a future change
 	// adds, which is the point of doing it here rather than per call site.
-	base := botOpts.BotClient
-	if base == nil {
-		base = &gotgbot.BaseBotClient{DefaultRequestOpts: botOpts.RequestOpts}
-	}
-	lc := &limitedClient{inner: base, limiter: limiter}
+	lc := &limitedClient{inner: botOpts.BotClient, limiter: limiter}
 	botOpts.BotClient = lc
 
 	tg, err := gotgbot.NewBot(cfg.BotToken, botOpts)
@@ -201,6 +288,9 @@ func New(cfg *config.Config, database *db.DB, txt *texts.Loader) (*Bot, error) {
 // Run starts long polling and blocks until ctx is cancelled, then stops cleanly.
 func (b *Bot) Run(ctx context.Context) error {
 	b.runCtx = ctx
+	// Record when polling effectively starts: the health endpoint and the watchdog
+	// measure update-flow staleness from the successful getUpdates timestamps.
+	b.limiter.poll.start(time.Now())
 	if err := b.Updater.StartPolling(b.TG, &ext.PollingOpts{
 		GetUpdatesOpts: &gotgbot.GetUpdatesOpts{
 			// Set AllowedUpdates EXPLICITLY. Telegram remembers the last
@@ -226,19 +316,58 @@ func (b *Bot) Run(ctx context.Context) error {
 	b.startBackground(ctx)
 
 	<-ctx.Done()
-	slog.Info("stopping updater")
-	err := b.Updater.Stop()
-	// Deliver whatever was buffered right before SIGTERM. Polling has stopped, so no
-	// new messages can be added; this runs before the DB pool is closed. Bounded by
-	// a deadline so a hung Telegram call cannot block shutdown forever.
-	if b.batcher != nil {
-		b.batcher.Shutdown(10 * time.Second)
+	shutdownStart := time.Now()
+
+	// PHASE 1 — stop the updater, bounded. Run it in a goroutine so a hung
+	// long-poll HTTP call cannot block the rest of the drain; polling stopping is
+	// what guarantees no NEW update is dispatched while the batcher drains.
+	stopStart := time.Now()
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- b.Updater.Stop() }()
+	var err error
+	select {
+	case err = <-stopDone:
+		slog.Info("updater stopped", "duration", time.Since(stopStart).Round(time.Millisecond))
+	case <-time.After(shutdownUpdaterTimeout):
+		slog.Warn("updater did not stop within the shutdown budget; continuing",
+			"timeout", shutdownUpdaterTimeout)
 	}
-	// Drain tracked background work before main closes the DB pool, so nothing
-	// uses a closed pool (bounded — see waitBackground).
-	b.waitBackground(10 * time.Second)
+
+	// PHASE 2 — deliver whatever the batcher buffered right before SIGTERM.
+	// Polling has stopped, so no new messages can be added; this runs before the
+	// DB pool is closed. Bounded so a hung Telegram call cannot hang shutdown.
+	if b.batcher != nil {
+		batchStart := time.Now()
+		b.batcher.Shutdown(shutdownBatcherTimeout)
+		slog.Info("batcher drained", "duration", time.Since(batchStart).Round(time.Millisecond))
+	}
+
+	// PHASE 3 — drain tracked background work before main closes the DB pool, so
+	// nothing uses a closed pool (bounded — see waitBackground).
+	bgStart := time.Now()
+	b.waitBackground(shutdownBackgroundTimeout)
+	slog.Info("background work drained",
+		"duration", time.Since(bgStart).Round(time.Millisecond),
+		"total_shutdown", time.Since(shutdownStart).Round(time.Millisecond))
 	return err
 }
+
+// PollStatus returns a snapshot of the long-polling loop's activity (see
+// PollStatus in ratelimit.go). It is what main wires into /healthz and the
+// watchdog: a process that is alive but has received no update for minutes is
+// exactly the state the old TCP health probe called healthy.
+//
+// Nil-safe for a zero-value Bot (tests build one before Run wires the limiter).
+func (b *Bot) PollStatus() PollStatus {
+	if b == nil || b.limiter == nil || b.limiter.poll == nil {
+		return PollStatus{}
+	}
+	return b.limiter.poll.status()
+}
+
+// LastPollOK is the time of the most recent successful getUpdates (zero if none
+// has succeeded yet).
+func (b *Bot) LastPollOK() time.Time { return b.PollStatus().LastSuccess }
 
 // isAdmin reports whether a uid is in the configured ADMINS list.
 func (b *Bot) isAdmin(uid string) bool { return b.admins[uid] }
@@ -298,11 +427,51 @@ func (b *Bot) onPanic(tg *gotgbot.Bot, ctx *ext.Context, r any) {
 	b.reportIncident(tg, ctx, code, summary, pages)
 }
 
+// beginIncident is the C-1b throttle gate shared by onError/onPanic. It answers
+// "may this incident be reported now, and how many were suppressed since the last
+// report?".
+//
+// During a systematic fault (a broken handler, a wildly malformed update) the
+// same incident can fire thousands of times a minute. Every incident used to cost
+// TWO more Telegram sends (the ERROR_CHAT_ID summary and the user's tracking-code
+// reply) at the exact moment the bot was already struggling. One report per
+// incidentWindow keeps the signal while capping the cost; the suppressed count is
+// carried into the next report so nothing is hidden.
+func (b *Bot) beginIncident() (suppressed int, send bool) {
+	b.incidentMu.Lock()
+	defer b.incidentMu.Unlock()
+	now := time.Now()
+	if !b.lastIncidentAt.IsZero() && now.Sub(b.lastIncidentAt) < incidentWindow {
+		b.suppressedIncidents++
+		return b.suppressedIncidents, false
+	}
+	suppressed = b.suppressedIncidents
+	b.suppressedIncidents = 0
+	b.lastIncidentAt = now
+	return suppressed, true
+}
+
 // reportIncident files a tracked incident: it stores the detail pages under the
 // tracking code, sends a compact summary to ERROR_CHAT_ID with a "🔎 more" button
 // that pages the detail on demand, and replies to the triggering user with the
 // code. Shared by onError (the update dump) and onPanic (the stack trace).
+//
+// Throttled by beginIncident: an incident inside the window is counted, logged
+// and dropped without any Telegram send. The tracking code is still generated and
+// logged by the caller, so the logs remain a complete record even when the channel
+// report is suppressed.
 func (b *Bot) reportIncident(tg *gotgbot.Bot, ctx *ext.Context, code, summary string, detailPages []string) {
+	suppressed, send := b.beginIncident()
+	if !send {
+		slog.Warn("incident report throttled; suppressing duplicate",
+			"code", code, "suppressed_in_window", suppressed)
+		return
+	}
+	if suppressed > 0 {
+		// Fold the count into the summary that IS sent, so the channel shows that
+		// more of the same happened while reports were muted.
+		summary += fmt.Sprintf("\n\n(+%d similar suppressed)", suppressed)
+	}
 	if b.Cfg.ErrorChatID != "" {
 		if chatID, perr := strconv.ParseInt(b.Cfg.ErrorChatID, 10, 64); perr == nil {
 			b.errReports.put(code, detailPages)

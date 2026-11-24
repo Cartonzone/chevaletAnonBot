@@ -12,6 +12,7 @@ package config
 import (
 	"bufio"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -53,6 +54,17 @@ type Config struct {
 	DBPass string
 	DBHost string
 	DBPort int // optional (DB_PORT), defaults to 5432; config.py had no such key
+	// DBSSLMode is the libpq sslmode for the connection (DB_SSLMODE). "prefer"
+	// keeps the pre-hardening behaviour — TLS when the server offers it, plain
+	// otherwise — so an upgraded .env talks to the same database exactly as before.
+	DBSSLMode string
+	// DBConnectTimeout bounds ONE connection attempt at the libpq level
+	// (DB_CONNECT_TIMEOUT_SECONDS). The startup loop adds its own total budget on
+	// top of this, so a hung TCP handshake can never stall the boot indefinitely.
+	DBConnectTimeout time.Duration
+	// DBMaxConns is the pool ceiling (DB_MAX_CONNS). It must stay below
+	// PostgreSQL's max_connections minus the other clients' share.
+	DBMaxConns int
 
 	LogLevel string
 
@@ -64,6 +76,14 @@ type Config struct {
 	HealthPort    int
 	BotHealthPort int
 	BaseAddress   string
+	// HealthWatchdog turns the in-process watchdog on: after a startup grace it
+	// exits the process when the long-polling loop has gone quiet for this long or
+	// the database is unreachable, so Docker's restart policy can heal a hung bot.
+	// 0 disables it (HEALTH_WATCHDOG_SECONDS).
+	HealthWatchdog time.Duration
+	// HeartbeatURL is an optional uptime-ping URL GET-ed every 60s
+	// (HEARTBEAT_URL); empty disables it.
+	HeartbeatURL string
 
 	SendGMGN     bool
 	GMTime       [2]int // hour, minute
@@ -169,10 +189,17 @@ func Load() (*Config, error) {
 		c.DynsetPath = "dynamic_settings.json"
 	}
 
-	c.ReportChatID = opt("REPORT_CHAT_ID", "")
-	c.ErrorChatID = opt("ERROR_CHAT_ID", "")
+	c.ReportChatID = strings.TrimSpace(opt("REPORT_CHAT_ID", ""))
+	c.ErrorChatID = strings.TrimSpace(opt("ERROR_CHAT_ID", ""))
+	// Split on '|', trimming each entry and dropping blanks, so "111| 222|" and
+	// "111|222" mean the same thing. An untrimmed uid would silently stop that
+	// admin's commands from working (isAdmin compares the exact numeric string).
 	if admins := opt("ADMINS", ""); admins != "" {
-		c.Admins = strings.Split(admins, "|")
+		for _, a := range strings.Split(admins, "|") {
+			if a = strings.TrimSpace(a); a != "" {
+				c.Admins = append(c.Admins, a)
+			}
+		}
 	}
 	c.SellerAdmin = opt("SELLER_ADMIN", "")
 	c.SupportAdmin = opt("SUPPORT_ADMIN", "")
@@ -198,6 +225,25 @@ func Load() (*Config, error) {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			errs = append(errs, fmt.Sprintf("%s must be an integer (got %q)", key, v))
+		}
+		return n
+	}
+	// optIntRange parses an OPTIONAL integer env var within [lo,hi], recording a
+	// startup error (instead of silently keeping the default) when it is malformed
+	// or out of range.
+	optIntRange := func(key string, def, lo, hi int) int {
+		v := strings.TrimSpace(opt(key, ""))
+		if v == "" {
+			return def
+		}
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("%s must be an integer (got %q)", key, v))
+			return def
+		}
+		if n < lo || n > hi {
+			errs = append(errs, fmt.Sprintf("%s must be between %d and %d (got %d)", key, lo, hi, n))
+			return def
 		}
 		return n
 	}
@@ -228,6 +274,50 @@ func Load() (*Config, error) {
 		}
 	}
 
+	// DB_SSLMODE is the libpq sslmode the pool connects with. Validated eagerly:
+	// a typo would otherwise only surface as an opaque connect error (and, worse,
+	// silently change the transport security of the production connection).
+	// "prefer" is the pgx/libpq default and keeps the pre-hardening behaviour.
+	c.DBSSLMode = strings.ToLower(strings.TrimSpace(opt("DB_SSLMODE", "prefer")))
+	if c.DBSSLMode == "" {
+		c.DBSSLMode = "prefer"
+	}
+	switch c.DBSSLMode {
+	case "disable", "allow", "prefer", "require", "verify-ca", "verify-full":
+	default:
+		errs = append(errs, fmt.Sprintf(
+			"DB_SSLMODE must be one of disable|allow|prefer|require|verify-ca|verify-full (got %q)",
+			c.DBSSLMode))
+	}
+
+	// DB_CONNECT_TIMEOUT_SECONDS bounds ONE connection attempt; the startup retry
+	// loop in cmd/bot adds its own total budget on top. DB_MAX_CONNS is the pool
+	// ceiling (PostgreSQL's max_connections is shared with other clients).
+	c.DBConnectTimeout = time.Duration(optIntRange("DB_CONNECT_TIMEOUT_SECONDS", 5, 1, 60)) * time.Second
+	c.DBMaxConns = optIntRange("DB_MAX_CONNS", 20, 1, 100)
+
+	// HEALTH_WATCHDOG_SECONDS: 0 disables the watchdog; any positive value is the
+	// polling-stall threshold. Deliberately uncapped — an operator may want a very
+	// tolerant watchdog for a flaky network.
+	c.HealthWatchdog = 300 * time.Second
+	if v := strings.TrimSpace(opt("HEALTH_WATCHDOG_SECONDS", "")); v != "" {
+		if n, err := strconv.Atoi(v); err != nil || n < 0 {
+			errs = append(errs, fmt.Sprintf("HEALTH_WATCHDOG_SECONDS must be a non-negative integer (got %q)", v))
+		} else {
+			c.HealthWatchdog = time.Duration(n) * time.Second
+		}
+	}
+
+	// HEARTBEAT_URL: optional external uptime ping. Validated at startup — a typo
+	// would otherwise only show up as a warn line every 60s.
+	c.HeartbeatURL = strings.TrimSpace(opt("HEARTBEAT_URL", ""))
+	if c.HeartbeatURL != "" {
+		u, perr := url.Parse(c.HeartbeatURL)
+		if perr != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			errs = append(errs, fmt.Sprintf("HEARTBEAT_URL must be an absolute http(s) URL (got %q)", c.HeartbeatURL))
+		}
+	}
+
 	// AI_INTERVAL defaults to 5 (matches config.py's get with default 5).
 	c.AIInterval = 5
 	if v, ok := os.LookupEnv("AI_INTERVAL"); ok && v != "" {
@@ -236,6 +326,13 @@ func Load() (*Config, error) {
 		} else {
 			errs = append(errs, fmt.Sprintf("AI_INTERVAL must be an integer (got %q)", v))
 		}
+	}
+	// Clamp rather than fail: AI_INTERVAL is the pause between AI answers, so 0 or
+	// a negative value would turn the responder into a busy loop that hammers the
+	// AI endpoint. A too-small value is harmless; this only fixes the degenerate
+	// ones.
+	if c.AIInterval < 1 {
+		c.AIInterval = 1
 	}
 
 	// AI_ENABLED gates the GM-group AI auto-reply (and the outbound POST to AI_URL).
@@ -349,6 +446,43 @@ func Load() (*Config, error) {
 				c.TokenKeys = append(c.TokenKeys, k)
 			}
 		}
+	}
+
+	// --- range / cross-field validation --------------------------------------
+	// Ports are checked here rather than at use time: a bad DB_PORT or HEALTH_PORT
+	// used to surface much later as a confusing dial error (or a listener binding
+	// nothing). Failing the boot names the exact key.
+	if c.DBPort < 1 || c.DBPort > 65535 {
+		errs = append(errs, fmt.Sprintf("DB_PORT must be between 1 and 65535 (got %d)", c.DBPort))
+	}
+	if c.HealthPort < 1 || c.HealthPort > 65535 {
+		errs = append(errs, fmt.Sprintf("HEALTH_PORT must be between 1 and 65535 (got %d)", c.HealthPort))
+	}
+	if c.BotHealthPort != 0 && (c.BotHealthPort < 1 || c.BotHealthPort > 65535) {
+		errs = append(errs, fmt.Sprintf("BOT_HEALTH_PORT must be between 1 and 65535 (got %d)", c.BotHealthPort))
+	}
+	// Chat ids stay STRINGS (handlers ParseInt them at use time), but the syntax is
+	// validated eagerly: a typo in ERROR_CHAT_ID used to silently turn every error
+	// report into a no-op, and a typo in REPORT_CHAT_ID silently dropped reports.
+	for _, kv := range []struct{ key, val string }{
+		{"ERROR_CHAT_ID", c.ErrorChatID},
+		{"REPORT_CHAT_ID", c.ReportChatID},
+	} {
+		if kv.val == "" {
+			continue
+		}
+		if _, perr := strconv.ParseInt(kv.val, 10, 64); perr != nil {
+			errs = append(errs, fmt.Sprintf("%s must be an integer (got %q)", kv.key, kv.val))
+		}
+	}
+	// An inverted cid-length range would reject every id; a negative default cid
+	// limit would break the column default.
+	if c.MinCIDLength > c.MaxCIDLength {
+		errs = append(errs, fmt.Sprintf(
+			"MIN_CID_LENGTH (%d) must not exceed MAX_CID_LENGTH (%d)", c.MinCIDLength, c.MaxCIDLength))
+	}
+	if c.DefaultCIDLimit < 0 {
+		errs = append(errs, fmt.Sprintf("DEFAULT_CID_LIMIT must be non-negative (got %d)", c.DefaultCIDLimit))
 	}
 
 	if len(missing) > 0 {
