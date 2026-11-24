@@ -132,6 +132,12 @@ Repo-wide Go evidence (final run, go1.26.11, real PostgreSQL; full log
 | restore-safety regression | legacy `--create` dump vs v2 artifact through `restore-v2.sh` / `restore-drill.sh` | **PASS** — legacy refused (verify exit 1; drill FAIL; prod exit 3, live sentinel intact, no DB created); v2 verify+drill PASS |
 | container startup smoke | fake BOT_TOKEN + restored local DB | **PASS** — health→DB→texts order, `/healthz`+`/readyz` 200, exit 1 only at fake-token `getMe`; empty Texts and DYNSET-directory both exit 1 |
 
+GitHub Actions on the pushed branch (`hardening/v3.4.1`, run `45490482922`):
+**all jobs green** — build/vet/fmt/test, PostgreSQL integration (chevalet_test +
+botit), staticcheck, govulncheck, docker build, shellcheck/bash -n and compose
+config; the deploy job is skipped by design (`DEPLOY_ENABLED` unset until the new
+host's deploy path is installed with approval).
+
 Test counts: 3 new adversarial test files / 11 tests + every implementer test file;
 the full suite was run with `-race` three times (Lead harness, verifier final,
 coverage run) with zero failures. CI runs the same gates (PostgreSQL service job,
