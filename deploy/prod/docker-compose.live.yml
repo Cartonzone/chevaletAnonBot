@@ -19,7 +19,11 @@ services:
     image: postgres:16-alpine
     container_name: telegram-bot-db
     restart: unless-stopped
-    stop_grace_period: 30s
+    # NOTE: no stop_grace_period on the DB service. The running production DB
+    # container was created without one, and adding it to the stack of record
+    # makes `docker compose up -d` recreate the database container. A DB restart
+    # is a separate, approved maintenance action — never a side effect of a
+    # compose file edit.
     # The DB is only reachable on the internal compose network; never publish it.
     # DO NOT `docker compose down` this stack (it removes/stops the DB): use
     # `docker stop/start telegram-bot` for the bot alone.
@@ -35,6 +39,10 @@ services:
         max-file: "3"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      # Legacy mount retained from v3.4.0: the old backup scripts used it. Keeping
+      # it in the stack of record prevents a plain `docker compose up -d` from
+      # seeing a config diff and recreating the DATABASE container.
+      - ./backups:/backups
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
       interval: 10s
