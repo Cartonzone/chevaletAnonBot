@@ -143,6 +143,18 @@ the full suite was run with `-race` three times (Lead harness, verifier final,
 coverage run) with zero failures. CI runs the same gates (PostgreSQL service job,
 staticcheck, govulncheck, docker build, shellcheck, compose config).
 
+## 4b. Deployment record (production)
+
+**Deployed 2026-11-26 02:29:45 Tehran** (bot-only restart, measured downtime **7 s**):
+image `chevalet-bot:v3.4.1` / `sha256:828f677b154e…`, DB container untouched
+(started 2026-11-23 20:42:55Z), 0 restarts / 0 ERROR logs, `/healthz`+`/readyz` 200,
+polling OK, users 38,031 at deploy and growing, nightly Telegram backup delivered
+02:47 local, certified backups every 15 min with a PASS drill, TON stack and
+`tonpayment.net` unaffected (HTTP 200), external watchdog green.
+Rollback: `chevalet-bot:rollback-latest` (v3.4.0) + `docker-compose.rollback.yml`,
+pre-deploy captures in `/opt/bots/chevalet/releases/20261126_0135/`.
+Full evidence/record: `audit/2026-11-24/DEPLOY-REPORT-20261126.md` (local, not in repo).
+
 ## 5. Upgrade procedure (summary)
 
 Full phased, reversible steps: [`deploy/prod/ROLLOUT.md`](../../deploy/prod/ROLLOUT.md).
