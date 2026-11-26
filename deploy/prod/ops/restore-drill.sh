@@ -238,15 +238,27 @@ DRILL_CREATED=1
 drill_port=$(docker port "$DRILL_NAME" 5432/tcp 2>/dev/null | head -n 1 || true)
 log "drill container up (host port: ${drill_port:-n/a}); waiting for readiness"
 
+# Wait for the FINAL server, not the init-phase temporary one. The official
+# postgres entrypoint starts a temporary server to run initdb, stops it, then
+# starts the real server; `pg_isready` succeeds during the temp phase too. The
+# 2026-11-26 04:31 scheduled drill connected in that window and failed with
+# "the database system is shutting down" — a false failure. Require BOTH:
+#   - the "ready to accept connections" log line at least twice (temp + final), and
+#   - two consecutive successful SQL probes one second apart.
 ready=0
-for _ in $(seq 1 60); do
-    if docker exec "$DRILL_NAME" pg_isready -U postgres -d mydatabase >/dev/null 2>&1; then
-        ready=1
-        break
+for _ in $(seq 1 90); do
+    starts=$(docker logs "$DRILL_NAME" 2>&1 | grep -c 'database system is ready to accept connections' || true)
+    if [ "${starts:-0}" -ge 2 ] &&
+       docker exec "$DRILL_NAME" psql -U postgres -d mydatabase -tAc 'select 1' >/dev/null 2>&1; then
+        sleep 1
+        if docker exec "$DRILL_NAME" psql -U postgres -d mydatabase -tAc 'select 1' >/dev/null 2>&1; then
+            ready=1
+            break
+        fi
     fi
     sleep 1
 done
-[ "$ready" -eq 1 ] || die "disposable postgres did not become ready within 60s"
+[ "$ready" -eq 1 ] || die "disposable postgres did not become stably ready within 90s"
 
 # ---------------------------------------------------------------------------
 # restore
@@ -258,6 +270,17 @@ gzip -dc "$ARTIFACT" | timeout --signal=TERM "$DRILL_TIMEOUT_SECONDS" \
     docker exec -i "$DRILL_NAME" psql -U postgres -d mydatabase -v ON_ERROR_STOP=1 -q >"$restore_log" 2>&1
 restore_rc=$?
 set -e
+# Defensive single retry for a container that is still finishing startup: a real
+# SQL error does not contain these transient markers and is never retried.
+if [ "$restore_rc" -ne 0 ] && grep -qiE 'the database system is (shutting down|starting up)|cannot connect now' "$restore_log" 2>/dev/null; then
+    log "restore hit a startup/shutdown window; retrying once after 5s"
+    sleep 5
+    set +e
+    gzip -dc "$ARTIFACT" | timeout --signal=TERM "$DRILL_TIMEOUT_SECONDS" \
+        docker exec -i "$DRILL_NAME" psql -U postgres -d mydatabase -v ON_ERROR_STOP=1 -q >"$restore_log" 2>&1
+    restore_rc=$?
+    set -e
+fi
 if [ "$restore_rc" -ne 0 ]; then
     log "restore log tail:"; tail -n 15 "$restore_log" | tee -a "$LOG_FILE" || true
     die "psql restore failed (rc=${restore_rc})"
